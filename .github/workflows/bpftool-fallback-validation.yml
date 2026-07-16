@@ -37,9 +37,7 @@ jobs:
             log "Installing tool packages to improve bpftool availability."
             sudo apt-get update
             sudo apt-get install -y --no-install-recommends \
-              linux-tools-common \
-              linux-tools-azure \
-              linux-cloud-tools-azure || true
+              linux-tools-common || true
             sudo apt-get install -y --no-install-recommends \
               "linux-tools-${KREL}" \
               "linux-cloud-tools-${KREL}" || true
@@ -73,8 +71,19 @@ jobs:
 
             if [[ -z "$FALLBACK" ]]; then
               log "No bpftool payload found under /usr/lib/linux-tools* or /usr/lib/linux-azure-tools*"
-              find /usr/lib -maxdepth 3 -type d \( -name 'linux-tools*' -o -name 'linux-azure-tools*' \) | tee -a "$LOG_FILE" || true
-              exit 1
+              log "Trying standalone bpftool package as a last-resort workaround source."
+              sudo apt-get install -y --no-install-recommends bpftool || true
+
+              FALLBACK="$(dpkg -L bpftool 2>/dev/null | grep -E '/bpftool$' | grep -v '^/usr/sbin/bpftool$' | head -n 1 || true)"
+              if [[ -z "$FALLBACK" ]]; then
+                FALLBACK="$(find /usr -type f -name 'bpftool' 2>/dev/null | grep -v '^/usr/sbin/bpftool$' | sort | tail -n 1 || true)"
+              fi
+
+              if [[ -z "$FALLBACK" ]]; then
+                find /usr/lib -maxdepth 3 -type d \( -name 'linux-tools*' -o -name 'linux-azure-tools*' \) | tee -a "$LOG_FILE" || true
+                dpkg -l | grep -E 'bpftool|linux-(tools|cloud-tools|azure-tools)' | tee -a "$LOG_FILE" || true
+                exit 1
+              fi
             fi
 
             log "Applying bpftool fallback from: ${FALLBACK}"
