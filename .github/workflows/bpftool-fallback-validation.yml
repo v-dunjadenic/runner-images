@@ -1,6 +1,6 @@
 name: BPFTool Fallback Validation
 
-'on':
+on:
   workflow_dispatch:
   push:
     paths:
@@ -14,166 +14,94 @@ jobs:
       contents: read
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Diagnose and apply fallback when needed
+      - name: Verify bpftool and apply minimal fallback
         shell: bash
         run: |
           set -euo pipefail
 
+          KREL="$(uname -r)"
+          WRAPPER="/usr/sbin/bpftool"
           LOG_FILE="$RUNNER_TEMP/bpftool-fallback.log"
-          : > "$LOG_FILE"
+          TMPDIR="$(mktemp -d)"
+          trap 'rm -rf "$TMPDIR"' EXIT
 
           log() {
             echo "$*" | tee -a "$LOG_FILE"
           }
 
-          KREL="$(uname -r)"
-          WRAPPER="/usr/sbin/bpftool"
-          FALLBACK_APPLIED="false"
-
-          install_kernel_tools() {
-            log "Installing tool packages to improve bpftool availability."
-            sudo apt-get update
-            sudo apt-get install -y --no-install-recommends \
-              linux-tools-common || true
-            sudo apt-get install -y --no-install-recommends \
-              "linux-tools-${KREL}" \
-              "linux-cloud-tools-${KREL}" || true
-          }
-
-          stage_bpftool_from_package() {
-            local package_name="$1"
-            local workdir deb_file candidate stable_dir stable_path
-
-            workdir="$(mktemp -d)"
-            pushd "$workdir" >/dev/null
-            if ! apt-get download "$package_name" >/dev/null 2>&1; then
-              popd >/dev/null
-              rm -rf "$workdir"
-              return 1
-            fi
-
-            deb_file="$(find . -maxdepth 1 -name "${package_name}"'*.deb' | sort | tail -n 1)"
-            if [[ -z "$deb_file" ]]; then
-              popd >/dev/null
-              rm -rf "$workdir"
-              return 1
-            fi
-
-            dpkg-deb -x "$deb_file" extracted >/dev/null 2>&1
-            candidate="$(find extracted -type f -name bpftool -perm -111 2>/dev/null | sort | pick_valid_candidate || true)"
-
-            if [[ -n "$candidate" ]]; then
-              stable_dir="/usr/local/lib/bpftool-fallback/${package_name}"
-              stable_path="${stable_dir}/bpftool"
-              sudo mkdir -p "$stable_dir"
-              sudo install -m 0755 "$candidate" "$stable_path"
-              echo "$stable_path"
-              popd >/dev/null
-              rm -rf "$workdir"
-              return 0
-            fi
-
-            popd >/dev/null
-            rm -rf "$workdir"
-
-            return 1
-          }
-
-          is_valid_bpftool_candidate() {
-            local candidate="$1"
-            local candidate_output
-
-            [[ -n "$candidate" ]] || return 1
-            [[ -x "$candidate" ]] || return 1
-            [[ "$candidate" != "/usr/sbin/bpftool" ]] || return 1
-
-            candidate_output="$($candidate -V 2>&1 || true)"
-            [[ "$candidate_output" == bpftool\ v* ]] || return 1
-            return 0
-          }
-
-          pick_valid_candidate() {
-            while IFS= read -r candidate; do
-              if is_valid_bpftool_candidate "$candidate"; then
-                echo "$candidate"
-                return 0
-              fi
-            done
-            return 1
-          }
-
+          : > "$LOG_FILE"
           log "=== bpftool fallback validation ==="
           log "Runner OS: ${RUNNER_OS}"
           log "Kernel release: ${KREL}"
+          log "Wrapper path: ${WRAPPER}"
 
-          if [[ ! -x "$WRAPPER" ]]; then
-            log "${WRAPPER} not found."
-            install_kernel_tools
+          if "$WRAPPER" -V >/dev/null 2>&1; then
+            log "bpftool already works on this runner. No fallback required."
+            exit 0
           fi
 
-          log "Wrapper path: $(command -v bpftool || echo missing)"
-          log "Wrapper real path: $(readlink -f "$(command -v bpftool 2>/dev/null || echo "$WRAPPER")" || echo unresolved)"
+          log "bpftool wrapper failed; attempting to stage a real executable from the matching kernel tools package."
+          sudo apt-get update
 
-          if ! "$WRAPPER" -V >/dev/null 2>&1; then
-            log "bpftool wrapper exists but failed to execute; collecting package inventory and retrying install."
-            dpkg -l | grep -E 'linux-(tools|cloud-tools|azure-tools)' | tee -a "$LOG_FILE" || true
-            install_kernel_tools
+          staged_binary=""
+          for package_name in "linux-tools-${KREL}" linux-tools-azure; do
+            log "Trying package: ${package_name}"
 
-            FALLBACK="$(find /usr/lib -type f \
-              \( -path '/usr/lib/linux-tools/*/bpftool' \
-                 -o -path '/usr/lib/linux-tools-*/bpftool' \
-                 -o -path '/usr/lib/linux-tools-*/*/bpftool' \
-                 -o -path '/usr/lib/linux-azure-tools/*/bpftool' \
-                 -o -path '/usr/lib/linux-azure-tools-*/bpftool' \
-                 -o -path '/usr/lib/linux-azure-tools-*/*/bpftool' \) \
-              2>/dev/null | sort | pick_valid_candidate || true)"
-
-            if [[ -z "$FALLBACK" ]]; then
-              log "No bpftool payload found under /usr/lib/linux-tools* or /usr/lib/linux-azure-tools*"
-              log "Trying package download and extraction as a last-resort workaround source."
-
-              for package_name in \
-                "linux-tools-${KREL}" \
-                linux-tools-azure; do
-                FALLBACK="$(stage_bpftool_from_package "$package_name" || true)"
-                if [[ -n "$FALLBACK" ]]; then
-                  break
-                fi
-              done
-
-              if [[ -z "$FALLBACK" ]]; then
-                find /usr/lib -maxdepth 3 -type d \( -name 'linux-tools*' -o -name 'linux-azure-tools*' \) | tee -a "$LOG_FILE" || true
-                dpkg -l | grep -E 'bpftool|linux-(tools|cloud-tools|azure-tools)' | tee -a "$LOG_FILE" || true
-                exit 1
-              fi
+            if ! apt-get download "$package_name" >/dev/null 2>&1; then
+              log "Unable to download ${package_name}."
+              continue
             fi
 
-            log "Applying bpftool fallback from: ${FALLBACK}"
+            deb_file="$(find . -maxdepth 1 -name "${package_name}_*.deb" | sort | tail -n 1)"
+            if [[ -z "$deb_file" ]]; then
+              log "Downloaded ${package_name} but no .deb file was found."
+              continue
+            fi
+
+            mkdir -p "$TMPDIR/extracted"
+            dpkg-deb -x "$deb_file" "$TMPDIR/extracted" >/dev/null 2>&1
+
+            candidate="$(find "$TMPDIR/extracted" -type f -name bpftool -perm -111 2>/dev/null | sort | tail -n 1)"
+            if [[ -z "$candidate" ]]; then
+              log "${package_name} did not contain a usable bpftool executable."
+              continue
+            fi
+
+            if ! "$candidate" -V >/dev/null 2>&1; then
+              log "Candidate from ${package_name} did not execute as bpftool."
+              continue
+            fi
+
+            staged_binary="/usr/local/bin/bpftool"
+            sudo install -m 0755 "$candidate" "$staged_binary"
             sudo mkdir -p "/usr/lib/linux-tools/${KREL}"
-            sudo ln -sf "$FALLBACK" "/usr/lib/linux-tools/${KREL}/bpftool"
-            FALLBACK_APPLIED="true"
-          else
-            log "No fallback required. bpftool wrapper already works."
+            sudo ln -sf "$staged_binary" "/usr/lib/linux-tools/${KREL}/bpftool"
+            log "Staged real bpftool binary from ${package_name}: ${staged_binary}"
+            break
+          done
+
+          if [[ -z "$staged_binary" ]]; then
+            log "No usable bpftool binary could be staged from the kernel tools packages."
+            log "This runner image needs an upstream packaging fix or a prebuilt bpftool binary source."
+            exit 1
           fi
 
           BPFT_VERSION_OUTPUT="$($WRAPPER -V 2>&1)"
           log "bpftool -V output: ${BPFT_VERSION_OUTPUT}"
+
           if [[ "$BPFT_VERSION_OUTPUT" != bpftool\ v* ]]; then
-            log "bpftool validation failed: wrapper did not return a valid version string."
+            log "bpftool validation failed after fallback staging."
             exit 1
           fi
-          log "Kernel expected path exists: $(test -e "/usr/lib/linux-tools/${KREL}/bpftool" && echo yes || echo no)"
+
           log "Kernel expected path target: $(readlink -f "/usr/lib/linux-tools/${KREL}/bpftool" 2>/dev/null || echo missing)"
-          log "Fallback applied: ${FALLBACK_APPLIED}"
+          log "Fallback applied: true"
 
           {
             echo "## BPFTool Fallback Validation"
             echo ""
             echo "- Kernel release: ${KREL}"
-            echo "- Fallback applied: ${FALLBACK_APPLIED}"
+            echo "- Fallback applied: true"
             echo "- bpftool check: success"
           } >> "$GITHUB_STEP_SUMMARY"
 
