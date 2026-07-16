@@ -2,6 +2,11 @@ name: BPFTool Fallback Validation
 
 on:
   workflow_dispatch:
+    inputs:
+      force_fallback:
+        description: "Remove the expected bpftool path first to force the fallback logic to run, even on images where bpftool already works."
+        type: boolean
+        default: false
   push:
     paths:
       - .github/workflows/bpftool-fallback-validation.yml
@@ -13,100 +18,96 @@ jobs:
     permissions:
       contents: read
 
+    env:
+      LOG_FILE: ${{ github.workspace }}/bpftool-fallback.log
+
     steps:
-      - name: Verify bpftool and apply minimal fallback
+      - name: Diagnose runner bpftool state
+        shell: bash
+        run: |
+          set -uo pipefail
+          KREL="$(uname -r)"
+          {
+            echo "=== bpftool diagnostics ==="
+            echo "Runner OS:        ${RUNNER_OS}"
+            echo "Kernel release:   ${KREL}"
+            echo
+            echo "--- Out-of-the-box: /usr/sbin/bpftool -V ---"
+            /usr/sbin/bpftool -V 2>&1 || echo "(bpftool wrapper failed as expected for this kernel)"
+            echo
+            echo "--- Existing bpftool payloads under /usr/lib ---"
+            find /usr/lib -type f -name bpftool 2>/dev/null || true
+            echo
+            echo "--- apt candidates for tools packages ---"
+            apt-cache policy linux-tools-generic linux-tools-azure "linux-tools-${KREL}" 2>/dev/null \
+              | grep -E 'linux-tools|Candidate|Installed' || true
+          } | tee "$LOG_FILE"
+
+      - name: Ensure bpftool works on current kernel (workaround under test)
+        shell: bash
+        env:
+          FORCE_FALLBACK: ${{ inputs.force_fallback }}
+        run: |
+          # ----------------------------------------------------------------
+          # This is the exact snippet suggested to users in issue #14203.
+          # It is idempotent and a safe no-op when bpftool already works.
+          # ----------------------------------------------------------------
+          set -euo pipefail
+          KREL="$(uname -r)"
+
+          # Optional: simulate the broken state on images that already work,
+          # so the POC exercises the fallback path regardless of image version.
+          if [[ "${FORCE_FALLBACK:-false}" == "true" ]]; then
+            echo "force_fallback=true: removing any existing ${KREL} bpftool link to simulate the bug."
+            sudo rm -f "/usr/lib/linux-tools/${KREL}/bpftool"
+          fi
+
+          if ! /usr/sbin/bpftool -V >/dev/null 2>&1; then
+            echo "bpftool wrapper fails for kernel ${KREL}; applying fallback."
+
+            # The kernel-matched Azure tools package is currently missing the
+            # bpftool binary (LP#2154331). Make sure a real bpftool binary is
+            # present by installing the generic linux-tools line, which ships it.
+            if ! find /usr/lib -type f -name bpftool -perm -111 2>/dev/null | grep -q .; then
+              sudo apt-get update
+              sudo apt-get install -y --no-install-recommends linux-tools-generic
+            fi
+
+            FALLBACK="$(find /usr/lib -type f -name bpftool -perm -111 2>/dev/null | sort -V | tail -n 1)"
+            if [[ -z "${FALLBACK}" ]]; then
+              echo "No bpftool payload found under /usr/lib after install." >&2
+              exit 1
+            fi
+
+            echo "Linking bpftool fallback: ${FALLBACK}"
+            sudo mkdir -p "/usr/lib/linux-tools/${KREL}"
+            sudo ln -sf "${FALLBACK}" "/usr/lib/linux-tools/${KREL}/bpftool"
+          fi
+
+          # Must succeed now.
+          /usr/sbin/bpftool -V
+
+      - name: Verify and summarize
         shell: bash
         run: |
           set -euo pipefail
-
           KREL="$(uname -r)"
-          WRAPPER="/usr/sbin/bpftool"
-          LOG_FILE="$RUNNER_TEMP/bpftool-fallback.log"
-          TMPDIR="$(mktemp -d)"
-          trap 'rm -rf "$TMPDIR"' EXIT
+          OUT="$(/usr/sbin/bpftool -V 2>&1)"
+          echo "bpftool -V => ${OUT}" | tee -a "$LOG_FILE"
 
-          log() {
-            echo "$*" | tee -a "$LOG_FILE"
-          }
-
-          : > "$LOG_FILE"
-          log "=== bpftool fallback validation ==="
-          log "Runner OS: ${RUNNER_OS}"
-          log "Kernel release: ${KREL}"
-          log "Wrapper path: ${WRAPPER}"
-
-          if "$WRAPPER" -V >/dev/null 2>&1; then
-            log "bpftool already works on this runner. No fallback required."
-            exit 0
-          fi
-
-          log "bpftool wrapper failed; attempting to stage a real executable from the matching kernel tools package."
-          sudo apt-get update
-
-          staged_binary=""
-          kernel_version="${KREL%-azure}"
-          for package_name in \
-            "linux-azure-6.17-tools-${kernel_version}" \
-            "linux-tools-${KREL}" \
-            linux-tools-azure; do
-            log "Trying package: ${package_name}"
-
-            if ! apt-get download "$package_name" >/dev/null 2>&1; then
-              log "Unable to download ${package_name}."
-              continue
-            fi
-
-            deb_file="$(find . -maxdepth 1 -name "${package_name}_*.deb" | sort | tail -n 1)"
-            if [[ -z "$deb_file" ]]; then
-              log "Downloaded ${package_name} but no .deb file was found."
-              continue
-            fi
-
-            mkdir -p "$TMPDIR/extracted"
-            dpkg-deb -x "$deb_file" "$TMPDIR/extracted" >/dev/null 2>&1
-
-            candidate="$(find "$TMPDIR/extracted" -type f -name bpftool -perm -111 2>/dev/null | sort | tail -n 1)"
-            if [[ -z "$candidate" ]]; then
-              log "${package_name} did not contain a usable bpftool executable."
-              continue
-            fi
-
-            if ! "$candidate" -V >/dev/null 2>&1; then
-              log "Candidate from ${package_name} did not execute as bpftool."
-              continue
-            fi
-
-            staged_binary="/usr/local/bin/bpftool"
-            sudo install -m 0755 "$candidate" "$staged_binary"
-            sudo mkdir -p "/usr/lib/linux-tools/${KREL}"
-            sudo ln -sf "$staged_binary" "/usr/lib/linux-tools/${KREL}/bpftool"
-            log "Staged real bpftool binary from ${package_name}: ${staged_binary}"
-            break
-          done
-
-          if [[ -z "$staged_binary" ]]; then
-            log "No usable bpftool binary could be staged from the kernel tools packages."
-            log "This runner image needs an upstream packaging fix or a prebuilt bpftool binary source."
+          if [[ "${OUT}" != bpftool\ v* ]]; then
+            echo "bpftool validation FAILED after workaround." >&2
             exit 1
           fi
 
-          BPFT_VERSION_OUTPUT="$($WRAPPER -V 2>&1)"
-          log "bpftool -V output: ${BPFT_VERSION_OUTPUT}"
-
-          if [[ "$BPFT_VERSION_OUTPUT" != bpftool\ v* ]]; then
-            log "bpftool validation failed after fallback staging."
-            exit 1
-          fi
-
-          log "Kernel expected path target: $(readlink -f "/usr/lib/linux-tools/${KREL}/bpftool" 2>/dev/null || echo missing)"
-          log "Fallback applied: true"
-
+          TARGET="$(readlink -f "/usr/lib/linux-tools/${KREL}/bpftool" 2>/dev/null || echo 'n/a (wrapper resolved without fallback)')"
           {
             echo "## BPFTool Fallback Validation"
             echo ""
-            echo "- Kernel release: ${KREL}"
-            echo "- Fallback applied: true"
-            echo "- bpftool check: success"
+            echo "- Kernel release: \`${KREL}\`"
+            echo "- bpftool version: \`${OUT%%$'\n'*}\`"
+            echo "- Resolved binary: \`${TARGET}\`"
+            echo "- Result: success"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload diagnostics
