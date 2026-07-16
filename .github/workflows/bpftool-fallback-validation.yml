@@ -1,0 +1,88 @@
+name: BPFTool Fallback Validation
+
+'on':
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/bpftool-fallback-validation.yml
+
+jobs:
+  validate-bpftool-fallback:
+    name: Validate bpftool fallback on Ubuntu 24.04
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Diagnose and apply fallback when needed
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          LOG_FILE="$RUNNER_TEMP/bpftool-fallback.log"
+          : > "$LOG_FILE"
+
+          log() {
+            echo "$*" | tee -a "$LOG_FILE"
+          }
+
+          KREL="$(uname -r)"
+          WRAPPER="/usr/sbin/bpftool"
+          FALLBACK_APPLIED="false"
+
+          log "=== bpftool fallback validation ==="
+          log "Runner OS: ${RUNNER_OS}"
+          log "Kernel release: ${KREL}"
+
+          if [[ ! -x "$WRAPPER" ]]; then
+            log "${WRAPPER} not found. Installing common Azure kernel tools."
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends \
+              linux-tools-common \
+              linux-tools-azure \
+              linux-cloud-tools-azure
+          fi
+
+          log "Wrapper path: $(command -v bpftool || echo missing)"
+          log "Wrapper real path: $(readlink -f "$(command -v bpftool 2>/dev/null || echo "$WRAPPER")" || echo unresolved)"
+
+          if ! "$WRAPPER" -V >/dev/null 2>&1; then
+            FALLBACK="$(find /usr/lib -type f \
+              \( -path '/usr/lib/linux-tools/*/bpftool' -o -path '/usr/lib/linux-tools-*/bpftool' -o -path '/usr/lib/linux-tools-*/*/bpftool' \) \
+              2>/dev/null | sort | tail -n 1)"
+
+            if [[ -z "$FALLBACK" ]]; then
+              log "No bpftool payload found under /usr/lib/linux-tools*"
+              exit 1
+            fi
+
+            log "Applying bpftool fallback from: ${FALLBACK}"
+            sudo mkdir -p "/usr/lib/linux-tools/${KREL}"
+            sudo ln -sf "$FALLBACK" "/usr/lib/linux-tools/${KREL}/bpftool"
+            FALLBACK_APPLIED="true"
+          else
+            log "No fallback required. bpftool wrapper already works."
+          fi
+
+          BPFT_VERSION_OUTPUT="$($WRAPPER -V 2>&1)"
+          log "bpftool -V output: ${BPFT_VERSION_OUTPUT}"
+          log "Kernel expected path exists: $(test -e "/usr/lib/linux-tools/${KREL}/bpftool" && echo yes || echo no)"
+          log "Kernel expected path target: $(readlink -f "/usr/lib/linux-tools/${KREL}/bpftool" 2>/dev/null || echo missing)"
+          log "Fallback applied: ${FALLBACK_APPLIED}"
+
+          {
+            echo "## BPFTool Fallback Validation"
+            echo ""
+            echo "- Kernel release: ${KREL}"
+            echo "- Fallback applied: ${FALLBACK_APPLIED}"
+            echo "- bpftool check: success"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: bpftool-fallback-diagnostics
+          path: ${{ runner.temp }}/bpftool-fallback.log
