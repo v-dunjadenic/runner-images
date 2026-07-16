@@ -33,29 +33,47 @@ jobs:
           WRAPPER="/usr/sbin/bpftool"
           FALLBACK_APPLIED="false"
 
+          install_kernel_tools() {
+            log "Installing tool packages to improve bpftool availability."
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends \
+              linux-tools-common \
+              linux-tools-azure \
+              linux-cloud-tools-azure || true
+            sudo apt-get install -y --no-install-recommends \
+              "linux-tools-${KREL}" \
+              "linux-cloud-tools-${KREL}" || true
+          }
+
           log "=== bpftool fallback validation ==="
           log "Runner OS: ${RUNNER_OS}"
           log "Kernel release: ${KREL}"
 
           if [[ ! -x "$WRAPPER" ]]; then
-            log "${WRAPPER} not found. Installing common Azure kernel tools."
-            sudo apt-get update
-            sudo apt-get install -y --no-install-recommends \
-              linux-tools-common \
-              linux-tools-azure \
-              linux-cloud-tools-azure
+            log "${WRAPPER} not found."
+            install_kernel_tools
           fi
 
           log "Wrapper path: $(command -v bpftool || echo missing)"
           log "Wrapper real path: $(readlink -f "$(command -v bpftool 2>/dev/null || echo "$WRAPPER")" || echo unresolved)"
 
           if ! "$WRAPPER" -V >/dev/null 2>&1; then
+            log "bpftool wrapper exists but failed to execute; collecting package inventory and retrying install."
+            dpkg -l | grep -E 'linux-(tools|cloud-tools|azure-tools)' | tee -a "$LOG_FILE" || true
+            install_kernel_tools
+
             FALLBACK="$(find /usr/lib -type f \
-              \( -path '/usr/lib/linux-tools/*/bpftool' -o -path '/usr/lib/linux-tools-*/bpftool' -o -path '/usr/lib/linux-tools-*/*/bpftool' \) \
+              \( -path '/usr/lib/linux-tools/*/bpftool' \
+                 -o -path '/usr/lib/linux-tools-*/bpftool' \
+                 -o -path '/usr/lib/linux-tools-*/*/bpftool' \
+                 -o -path '/usr/lib/linux-azure-tools/*/bpftool' \
+                 -o -path '/usr/lib/linux-azure-tools-*/bpftool' \
+                 -o -path '/usr/lib/linux-azure-tools-*/*/bpftool' \) \
               2>/dev/null | sort | tail -n 1)"
 
             if [[ -z "$FALLBACK" ]]; then
-              log "No bpftool payload found under /usr/lib/linux-tools*"
+              log "No bpftool payload found under /usr/lib/linux-tools* or /usr/lib/linux-azure-tools*"
+              find /usr/lib -maxdepth 3 -type d \( -name 'linux-tools*' -o -name 'linux-azure-tools*' \) | tee -a "$LOG_FILE" || true
               exit 1
             fi
 
