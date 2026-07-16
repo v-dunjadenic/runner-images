@@ -44,7 +44,11 @@ jobs:
           sudo apt-get update
 
           staged_binary=""
-          for package_name in "linux-tools-${KREL}" linux-tools-azure; do
+          kernel_version="${KREL%-azure}"
+          for package_name in \
+            "linux-azure-6.17-tools-${kernel_version}" \
+            "linux-tools-${KREL}" \
+            linux-tools-azure; do
             log "Trying package: ${package_name}"
 
             if ! apt-get download "$package_name" >/dev/null 2>&1; then
