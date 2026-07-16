@@ -43,6 +43,45 @@ jobs:
               "linux-cloud-tools-${KREL}" || true
           }
 
+          stage_bpftool_from_package() {
+            local package_name="$1"
+            local workdir deb_file candidate stable_dir stable_path
+
+            workdir="$(mktemp -d)"
+            pushd "$workdir" >/dev/null
+            if ! apt-get download "$package_name" >/dev/null 2>&1; then
+              popd >/dev/null
+              rm -rf "$workdir"
+              return 1
+            fi
+
+            deb_file="$(find . -maxdepth 1 -name "${package_name}"'*.deb' | sort | tail -n 1)"
+            if [[ -z "$deb_file" ]]; then
+              popd >/dev/null
+              rm -rf "$workdir"
+              return 1
+            fi
+
+            dpkg-deb -x "$deb_file" extracted >/dev/null 2>&1
+            candidate="$(find extracted -type f -name bpftool -perm -111 2>/dev/null | sort | pick_valid_candidate || true)"
+
+            if [[ -n "$candidate" ]]; then
+              stable_dir="/usr/local/lib/bpftool-fallback/${package_name}"
+              stable_path="${stable_dir}/bpftool"
+              sudo mkdir -p "$stable_dir"
+              sudo install -m 0755 "$candidate" "$stable_path"
+              echo "$stable_path"
+              popd >/dev/null
+              rm -rf "$workdir"
+              return 0
+            fi
+
+            popd >/dev/null
+            rm -rf "$workdir"
+
+            return 1
+          }
+
           is_valid_bpftool_candidate() {
             local candidate="$1"
             local candidate_output
@@ -94,13 +133,16 @@ jobs:
 
             if [[ -z "$FALLBACK" ]]; then
               log "No bpftool payload found under /usr/lib/linux-tools* or /usr/lib/linux-azure-tools*"
-              log "Trying standalone bpftool package as a last-resort workaround source."
-              sudo apt-get install -y --no-install-recommends bpftool || true
+              log "Trying package download and extraction as a last-resort workaround source."
 
-              FALLBACK="$(dpkg -L bpftool 2>/dev/null | grep -E '/bpftool$' | pick_valid_candidate || true)"
-              if [[ -z "$FALLBACK" ]]; then
-                FALLBACK="$(find /usr -type f -name 'bpftool' 2>/dev/null | sort | pick_valid_candidate || true)"
-              fi
+              for package_name in \
+                "linux-tools-${KREL}" \
+                linux-tools-azure; do
+                FALLBACK="$(stage_bpftool_from_package "$package_name" || true)"
+                if [[ -n "$FALLBACK" ]]; then
+                  break
+                fi
+              done
 
               if [[ -z "$FALLBACK" ]]; then
                 find /usr/lib -maxdepth 3 -type d \( -name 'linux-tools*' -o -name 'linux-azure-tools*' \) | tee -a "$LOG_FILE" || true
