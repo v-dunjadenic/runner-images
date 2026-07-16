@@ -111,7 +111,9 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload diagnostics
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: bpftool-fallback-diagnostics
-          path: ${{ runner.temp }}/bpftool-fallback.log
+          path: ${{ github.workspace }}/bpftool-fallback.log
+          if-no-files-found: warn
