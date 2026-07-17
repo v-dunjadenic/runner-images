@@ -1,0 +1,222 @@
+name: Repro - Appx dependency missing
+
+on:
+  push:
+    branches-ignore:
+      - main
+    paths:
+      - ".github/workflows/repro-appx-missing-dependency.yml"
+      - ".github/repro/appx-dependency/**"
+  workflow_dispatch:
+    inputs:
+      solution_glob:
+        description: "Build target path/glob (for example: **/*.slnx, **/*.sln, or **/*.wapproj)"
+        required: true
+        default: ".github/repro/appx-dependency/src/ReproPackaging/ReproPackaging.wapproj"
+      appx_package_dir:
+        description: "Directory where Appx output is written"
+        required: true
+        default: "appx-out"
+      dependency_dll:
+        description: "Dependency DLL to verify inside produced appx/msix"
+        required: true
+        default: "MahApps.Metro.dll"
+
+env:
+  REPRO_TARGET_GLOB: ${{ github.event_name == 'workflow_dispatch' && inputs.solution_glob || '.github/repro/appx-dependency/src/ReproPackaging/ReproPackaging.wapproj' }}
+  REPRO_APPX_PACKAGE_DIR: ${{ github.event_name == 'workflow_dispatch' && inputs.appx_package_dir || 'appx-out' }}
+  REPRO_DEPENDENCY_DLL: ${{ github.event_name == 'workflow_dispatch' && inputs.dependency_dll || 'MahApps.Metro.dll' }}
+
+jobs:
+  build-and-verify:
+    name: Build on ${{ matrix.image }}
+    runs-on: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - windows-latest
+          - windows-2025-vs2026
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show runner and VS/MSBuild info
+        shell: pwsh
+        run: |
+          Write-Host "Runner image: $env:ImageOS"
+          Write-Host "Image version: $env:ImageVersion"
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) {
+            throw "vswhere.exe not found at $vswhere"
+          }
+
+          Write-Host "--- Installed Visual Studio instances ---"
+          & $vswhere -all -products * -format json | Out-File -FilePath vs-instances.json -Encoding utf8
+          Get-Content .\vs-instances.json
+
+          $installPath = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
+          if (-not $installPath) {
+            throw "No Visual Studio installation with MSBuild was found"
+          }
+
+          $msbuild = Join-Path $installPath "MSBuild\Current\Bin\MSBuild.exe"
+          if (-not (Test-Path $msbuild)) {
+            throw "MSBuild.exe not found at $msbuild"
+          }
+
+          Write-Host "MSBuild path: $msbuild"
+          & $msbuild -version
+
+      - name: Resolve build target path
+        id: target
+        shell: pwsh
+        run: |
+          $pattern = "${env:REPRO_TARGET_GLOB}"
+          Write-Host "Searching for build target with pattern: $pattern"
+
+          $normalizedPattern = $pattern.Replace('/', '\\')
+          $allTargets = Get-ChildItem -Path $env:GITHUB_WORKSPACE -Recurse -File -Include *.sln,*.slnx,*.wapproj,*.csproj
+
+          $files = $allTargets | Where-Object {
+            $relative = $_.FullName.Substring($env:GITHUB_WORKSPACE.Length).TrimStart('\\')
+            $relative -like $normalizedPattern -or $_.Name -like $normalizedPattern
+          }
+
+          if (-not $files -or $files.Count -eq 0) {
+            throw "No build target files found for pattern: $pattern"
+          }
+
+          $targetPath = $files[0].FullName
+          Write-Host "Using build target: $targetPath"
+          "path=$targetPath" >> $env:GITHUB_OUTPUT
+
+      - name: Restore
+        shell: pwsh
+        run: |
+          $target = "${{ steps.target.outputs.path }}"
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installPath = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
+          $msbuild = Join-Path $installPath "MSBuild\Current\Bin\MSBuild.exe"
+
+          & $msbuild $target /t:Restore /p:Configuration=Release /p:Platform=x64 /m
+
+      - name: Build and package (issue-like args)
+        shell: pwsh
+        run: |
+          $target = "${{ steps.target.outputs.path }}"
+          $appxDir = Join-Path $env:GITHUB_WORKSPACE "${env:REPRO_APPX_PACKAGE_DIR}"
+
+          New-Item -Path $appxDir -ItemType Directory -Force | Out-Null
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installPath = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
+          $msbuild = Join-Path $installPath "MSBuild\Current\Bin\MSBuild.exe"
+
+          & $msbuild $target `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:AppxBundlePlatforms="x64" `
+            /p:AppxPackageDir="$appxDir" `
+            /p:AppxBundle=Always `
+            /p:UapAppxPackageBuildMode=SideLoadOnly `
+            /p:AppxPackageSigningEnabled=false `
+            /p:Company="Our Company" `
+            /m
+
+      - name: Inspect package contents for dependency
+        id: verify
+        shell: pwsh
+        run: |
+          $appxDir = Join-Path $env:GITHUB_WORKSPACE "${env:REPRO_APPX_PACKAGE_DIR}"
+          $dependency = "${env:REPRO_DEPENDENCY_DLL}"
+
+          $packages = Get-ChildItem -Path $appxDir -Recurse -File -Include *.appx,*.msix,*.appxbundle,*.msixbundle
+          if (-not $packages -or $packages.Count -eq 0) {
+            throw "No package files were produced under: $appxDir"
+          }
+
+          New-Item -Path .\extracted -ItemType Directory -Force | Out-Null
+          $found = $false
+
+          function Expand-NestedPackages {
+            param(
+              [Parameter(Mandatory = $true)]
+              [string]$Root
+            )
+
+            $archives = Get-ChildItem -Path $Root -Recurse -File |
+              Where-Object { $_.Extension -in @('.appx', '.msix', '.appxbundle', '.msixbundle') }
+
+            foreach ($archive in $archives) {
+              $zipPath = "$($archive.FullName).zip"
+              if (Test-Path $zipPath) {
+                continue
+              }
+
+              $extractDir = Join-Path $archive.DirectoryName "$($archive.BaseName)_expanded"
+              New-Item -Path $extractDir -ItemType Directory -Force | Out-Null
+
+              Copy-Item $archive.FullName $zipPath -Force
+              Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
+            }
+          }
+
+          foreach ($pkg in $packages) {
+            $target = Join-Path .\extracted $pkg.BaseName
+            New-Item -Path $target -ItemType Directory -Force | Out-Null
+
+            Copy-Item $pkg.FullName (Join-Path $target ($pkg.Name + ".zip")) -Force
+            Expand-Archive -Path (Join-Path $target ($pkg.Name + ".zip")) -DestinationPath $target -Force
+
+            # Bundles can contain nested appx/msix archives. Expand nested layers twice.
+            Expand-NestedPackages -Root $target
+            Expand-NestedPackages -Root $target
+
+            $match = Get-ChildItem -Path $target -Recurse -File -Filter $dependency -ErrorAction SilentlyContinue
+            if ($match) {
+              $found = $true
+              Write-Host "FOUND $dependency in package: $($pkg.FullName)"
+              $match | ForEach-Object { Write-Host "  -> $($_.FullName)" }
+            } else {
+              Write-Host "MISSING $dependency in package: $($pkg.FullName)"
+            }
+          }
+
+          "dependency_found=$found" >> $env:GITHUB_OUTPUT
+
+      - name: Save summary
+        shell: pwsh
+        run: |
+          $image = "${{ matrix.image }}"
+          $found = "${{ steps.verify.outputs.dependency_found }}"
+
+          "# Appx Dependency Repro Summary ($image)" | Out-File -FilePath summary.md -Encoding utf8
+          "" | Out-File -FilePath summary.md -Append -Encoding utf8
+          "- Runner Image: $env:ImageOS" | Out-File -FilePath summary.md -Append -Encoding utf8
+          "- Image Version: $env:ImageVersion" | Out-File -FilePath summary.md -Append -Encoding utf8
+          "- Build Target Glob: $env:REPRO_TARGET_GLOB" | Out-File -FilePath summary.md -Append -Encoding utf8
+          "- Dependency Checked: $env:REPRO_DEPENDENCY_DLL" | Out-File -FilePath summary.md -Append -Encoding utf8
+          "- Dependency Found In Package: $found" | Out-File -FilePath summary.md -Append -Encoding utf8
+
+          Get-Content .\summary.md
+
+      - name: Upload diagnostics artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: repro-${{ matrix.image }}
+          if-no-files-found: warn
+          path: |
+            vs-instances.json
+            summary.md
+            extracted/**
+            ${{ env.REPRO_APPX_PACKAGE_DIR }}
+
+      - name: Fail if dependency missing
+        if: steps.verify.outputs.dependency_found != 'True'
+        shell: pwsh
+        run: |
+          throw "Dependency $env:REPRO_DEPENDENCY_DLL was not found in package on ${{ matrix.image }}"
