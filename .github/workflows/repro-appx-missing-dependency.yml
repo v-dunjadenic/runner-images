@@ -77,8 +77,18 @@ jobs:
           $pattern = "${env:REPRO_TARGET_GLOB}"
           Write-Host "Searching for build target with pattern: $pattern"
 
-          $normalizedPattern = $pattern.Replace('/', '\\')
-          $allTargets = Get-ChildItem -Path $env:GITHUB_WORKSPACE -Recurse -File -Include *.sln,*.slnx,*.wapproj,*.csproj
+          $normalizedPattern = $pattern.Replace('/', '\\').TrimStart('.').TrimStart('\\')
+          $directPath = Join-Path $env:GITHUB_WORKSPACE $normalizedPattern
+
+          if (Test-Path $directPath) {
+            $targetPath = (Resolve-Path $directPath).Path
+            Write-Host "Using direct build target path: $targetPath"
+            "path=$targetPath" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+
+          $allTargets = Get-ChildItem -Path $env:GITHUB_WORKSPACE -Recurse -File -Force |
+            Where-Object { $_.Extension -in @('.sln', '.slnx', '.wapproj', '.csproj') }
 
           $files = $allTargets | Where-Object {
             $relative = $_.FullName.Substring($env:GITHUB_WORKSPACE.Length).TrimStart('\\')
@@ -86,11 +96,18 @@ jobs:
           }
 
           if (-not $files -or $files.Count -eq 0) {
+            Write-Host "No match for pattern '$pattern'."
+            Write-Host "Searched direct path: $directPath"
+            Write-Host "Available build targets:"
+            $allTargets | ForEach-Object {
+              $relative = $_.FullName.Substring($env:GITHUB_WORKSPACE.Length).TrimStart('\\')
+              Write-Host "  - $relative"
+            }
             throw "No build target files found for pattern: $pattern"
           }
 
-          $targetPath = $files[0].FullName
-          Write-Host "Using build target: $targetPath"
+          $targetPath = $files | Select-Object -First 1 -ExpandProperty FullName
+          Write-Host "Using matched build target path: $targetPath"
           "path=$targetPath" >> $env:GITHUB_OUTPUT
 
       - name: Restore
