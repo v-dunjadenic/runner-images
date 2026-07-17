@@ -77,7 +77,10 @@ jobs:
           $pattern = "${env:REPRO_TARGET_GLOB}"
           Write-Host "Searching for build target with pattern: $pattern"
 
-          $normalizedPattern = $pattern.Replace('/', '\\').TrimStart('.').TrimStart('\\')
+          $normalizedPattern = $pattern.Replace('/', '\\')
+          if ($normalizedPattern.StartsWith('.\\') -or $normalizedPattern.StartsWith('./')) {
+            $normalizedPattern = $normalizedPattern.Substring(2)
+          }
           $directPath = Join-Path $env:GITHUB_WORKSPACE $normalizedPattern
 
           if (Test-Path $directPath) {
