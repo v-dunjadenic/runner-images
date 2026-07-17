@@ -54,12 +54,12 @@ jobs:
           }
 
           Write-Host "--- Installed Visual Studio instances ---"
-          & $vswhere -all -products * -format json | Out-File -FilePath vs-instances.json -Encoding utf8
+          & $vswhere -all -products * -requires Microsoft.Component.MSBuild -requires Microsoft.VisualStudio.ComponentGroup.MSIX.Packaging -format json | Out-File -FilePath vs-instances.json -Encoding utf8
           Get-Content .\vs-instances.json
 
-          $installPath = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
+          $installPath = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -requires Microsoft.VisualStudio.ComponentGroup.MSIX.Packaging -property installationPath
           if (-not $installPath) {
-            throw "No Visual Studio installation with MSBuild was found"
+            throw "No Visual Studio installation with MSBuild and Windows App Packaging/MSIX support was found"
           }
 
           $msbuild = Join-Path $installPath "MSBuild\Current\Bin\MSBuild.exe"
@@ -119,7 +119,7 @@ jobs:
           $target = "${{ steps.target.outputs.path }}"
 
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $installPath = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
+          $installPath = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -requires Microsoft.VisualStudio.ComponentGroup.MSIX.Packaging -property installationPath
           $msbuild = Join-Path $installPath "MSBuild\Current\Bin\MSBuild.exe"
 
           & $msbuild $target /t:Restore /p:Configuration=Release /p:Platform=x64 /m
@@ -133,7 +133,7 @@ jobs:
           New-Item -Path $appxDir -ItemType Directory -Force | Out-Null
 
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $installPath = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
+          $installPath = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -requires Microsoft.VisualStudio.ComponentGroup.MSIX.Packaging -property installationPath
           $msbuild = Join-Path $installPath "MSBuild\Current\Bin\MSBuild.exe"
 
           & $msbuild $target `
