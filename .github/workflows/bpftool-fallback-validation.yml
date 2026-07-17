@@ -1,6 +1,6 @@
 name: BPFTool Fallback Validation
 
-on:
+'on':
   workflow_dispatch:
     inputs:
       force_fallback:
@@ -48,10 +48,6 @@ jobs:
         env:
           FORCE_FALLBACK: ${{ inputs.force_fallback }}
         run: |
-          # ----------------------------------------------------------------
-          # This is the exact snippet suggested to users in issue #14203.
-          # It is idempotent and a safe no-op when bpftool already works.
-          # ----------------------------------------------------------------
           set -euo pipefail
           KREL="$(uname -r)"
 
