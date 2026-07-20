@@ -42,6 +42,43 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Generate valid Appx logo assets for repro sample
+        shell: pwsh
+        run: |
+          $assetRoot = Join-Path $env:GITHUB_WORKSPACE ".github\repro\appx-dependency\src\ReproPackaging\Assets"
+          if (-not (Test-Path $assetRoot)) {
+            Write-Host "Repro asset folder not found, skipping generated logos: $assetRoot"
+            exit 0
+          }
+
+          Add-Type -AssemblyName System.Drawing
+
+          function New-LogoPng {
+            param(
+              [Parameter(Mandatory = $true)]
+              [string]$Path,
+              [Parameter(Mandatory = $true)]
+              [int]$Width,
+              [Parameter(Mandatory = $true)]
+              [int]$Height
+            )
+
+            $bmp = New-Object System.Drawing.Bitmap($Width, $Height)
+            $gfx = [System.Drawing.Graphics]::FromImage($bmp)
+            $gfx.Clear([System.Drawing.Color]::FromArgb(255, 0, 120, 212))
+            $bmp.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png)
+            $gfx.Dispose()
+            $bmp.Dispose()
+          }
+
+          New-Item -Path $assetRoot -ItemType Directory -Force | Out-Null
+          New-LogoPng -Path (Join-Path $assetRoot "StoreLogo.png") -Width 50 -Height 50
+          New-LogoPng -Path (Join-Path $assetRoot "Square44x44Logo.png") -Width 44 -Height 44
+          New-LogoPng -Path (Join-Path $assetRoot "Square150x150Logo.png") -Width 150 -Height 150
+          New-LogoPng -Path (Join-Path $assetRoot "Wide310x150Logo.png") -Width 310 -Height 150
+
+          Write-Host "Generated valid Appx logo assets in: $assetRoot"
+
       - name: Show runner and VS/MSBuild info
         shell: pwsh
         run: |
