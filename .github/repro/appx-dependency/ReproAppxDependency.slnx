@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="src/ReproWpfApp/ReproWpfApp.csproj" />
+  <Project Path="src/ReproPackaging/ReproPackaging.wapproj" />
+</Solution>

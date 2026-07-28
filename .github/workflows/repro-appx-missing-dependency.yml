@@ -12,7 +12,7 @@ on:
       solution_glob:
         description: "Build target path/glob (for example: **/*.slnx, **/*.sln, or **/*.wapproj)"
         required: true
-        default: ".github/repro/appx-dependency/src/ReproPackaging/ReproPackaging.wapproj"
+        default: ".github/repro/appx-dependency/ReproAppxDependency.slnx"
       appx_package_dir:
         description: "Directory where Appx output is written"
         required: true
@@ -23,7 +23,7 @@ on:
         default: "MahApps.Metro.dll"
 
 env:
-  REPRO_TARGET_GLOB: ${{ github.event_name == 'workflow_dispatch' && inputs.solution_glob || '.github/repro/appx-dependency/src/ReproPackaging/ReproPackaging.wapproj' }}
+  REPRO_TARGET_GLOB: ${{ github.event_name == 'workflow_dispatch' && inputs.solution_glob || '.github/repro/appx-dependency/ReproAppxDependency.slnx' }}
   REPRO_APPX_PACKAGE_DIR: ${{ github.event_name == 'workflow_dispatch' && inputs.appx_package_dir || 'appx-out' }}
   REPRO_DEPENDENCY_DLL: ${{ github.event_name == 'workflow_dispatch' && inputs.dependency_dll || 'MahApps.Metro.dll' }}
 
@@ -159,7 +159,7 @@ jobs:
           $installPath = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -requires Microsoft.VisualStudio.ComponentGroup.MSIX.Packaging -property installationPath
           $msbuild = Join-Path $installPath "MSBuild\Current\Bin\MSBuild.exe"
 
-          & $msbuild $target /t:Restore /p:Configuration=Release /p:Platform=x64 /m
+          & $msbuild $target /t:Restore /p:Configuration=Release /p:Platform=x64 /m /bl:restore.binlog
 
       - name: Build and package (issue-like args)
         shell: pwsh
@@ -182,7 +182,8 @@ jobs:
             /p:UapAppxPackageBuildMode=SideLoadOnly `
             /p:AppxPackageSigningEnabled=false `
             /p:Company="Our Company" `
-            /m
+            /m `
+            /bl:build.binlog
 
       - name: Inspect package contents for dependency
         id: verify
@@ -262,6 +263,7 @@ jobs:
           Get-Content .\summary.md
 
       - name: Upload diagnostics artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: repro-${{ matrix.image }}
@@ -269,6 +271,8 @@ jobs:
           path: |
             vs-instances.json
             summary.md
+            restore.binlog
+            build.binlog
             extracted/**
             ${{ env.REPRO_APPX_PACKAGE_DIR }}
 
