@@ -2,9 +2,11 @@
   <Configurations>
     <BuildType Name="Debug" />
     <BuildType Name="Release" />
+    <Platform Name="Any CPU" />
     <Platform Name="x64" />
-    <Platform Name="x86" />
   </Configurations>
-  <Project Path="src/ReproWpfApp/ReproWpfApp.csproj" />
+  <Project Path="src/ReproWpfApp/ReproWpfApp.csproj">
+    <Build Solution="Release|Any CPU" Project="false" />
+  </Project>
   <Project Path="src/ReproPackaging/ReproPackaging.wapproj" Type="C7167F0D-BC9F-4E6E-AFE1-012C56B48DB5" />
 </Solution>

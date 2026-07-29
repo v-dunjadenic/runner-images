@@ -27,7 +27,6 @@
       <Project>{3AF9A599-8608-4C4E-B8D7-B127D4FCAC5D}</Project>
       <Name>ReproWpfApp</Name>
       <Private>true</Private>
-      <DoNotHarvest>true</DoNotHarvest>
     </ProjectReference>
   </ItemGroup>
 

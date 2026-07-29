@@ -29,14 +29,25 @@ env:
 
 jobs:
   build-and-verify:
-    name: Build on ${{ matrix.image }}
+    name: ${{ matrix.image }} / SDK ${{ matrix.sdk_band }}
     runs-on: ${{ matrix.image }}
     strategy:
       fail-fast: false
       matrix:
+        # windows-latest, windows-2025 and windows-2025-vs2026 all resolve to the same
+        # VS2026 image now, so windows-2022 is the only remaining VS2022 host and is the
+        # closest available stand-in for the retired image the issue was reported against.
         image:
           - windows-2022
           - windows-2025-vs2026
+        # The reported regression window moved the highest installed .NET SDK from the
+        # 10.0.2xx band to the 10.0.3xx band. The reporter has no global.json, so SDK
+        # resolution floats to whatever is highest. "floating" mirrors their setup; the
+        # pinned bands isolate the band as a variable on an otherwise identical image.
+        sdk_band:
+          - floating
+          - "10.0.200"
+          - "10.0.300"
 
     steps:
       - name: Checkout
@@ -106,6 +117,37 @@ jobs:
 
           Write-Host "MSBuild path: $msbuild"
           & $msbuild -version
+
+      - name: Select .NET SDK feature band
+        shell: pwsh
+        run: |
+          $band = "${{ matrix.sdk_band }}"
+          $reproRoot = Join-Path $env:GITHUB_WORKSPACE ".github\repro\appx-dependency"
+          $globalJson = Join-Path $reproRoot "global.json"
+
+          if ($band -eq "floating") {
+            Remove-Item -Path $globalJson -Force -ErrorAction SilentlyContinue
+            Write-Host "No global.json written. SDK resolution floats to the highest installed version, matching the reporter's setup."
+          } else {
+            $content = [ordered]@{
+              sdk = [ordered]@{
+                version     = $band
+                rollForward = "latestPatch"
+              }
+            } | ConvertTo-Json
+
+            Set-Content -Path $globalJson -Value $content -Encoding utf8
+            Write-Host "Pinned SDK feature band via global.json:"
+            Get-Content $globalJson
+          }
+
+          Write-Host "--- Installed SDKs ---"
+          dotnet --list-sdks
+
+          Write-Host "--- SDK resolved for the repro directory ---"
+          Push-Location $reproRoot
+          dotnet --version
+          Pop-Location
 
       - name: Resolve build target path
         id: target
@@ -250,12 +292,20 @@ jobs:
         shell: pwsh
         run: |
           $image = "${{ matrix.image }}"
+          $band = "${{ matrix.sdk_band }}"
           $found = "${{ steps.verify.outputs.dependency_found }}"
 
-          "# Appx Dependency Repro Summary ($image)" | Out-File -FilePath summary.md -Encoding utf8
+          $reproRoot = Join-Path $env:GITHUB_WORKSPACE ".github\repro\appx-dependency"
+          Push-Location $reproRoot
+          $resolvedSdk = dotnet --version
+          Pop-Location
+
+          "# Appx Dependency Repro Summary ($image / SDK $band)" | Out-File -FilePath summary.md -Encoding utf8
           "" | Out-File -FilePath summary.md -Append -Encoding utf8
           "- Runner Image: $env:ImageOS" | Out-File -FilePath summary.md -Append -Encoding utf8
           "- Image Version: $env:ImageVersion" | Out-File -FilePath summary.md -Append -Encoding utf8
+          "- Requested SDK Band: $band" | Out-File -FilePath summary.md -Append -Encoding utf8
+          "- Resolved SDK: $resolvedSdk" | Out-File -FilePath summary.md -Append -Encoding utf8
           "- Build Target Glob: $env:REPRO_TARGET_GLOB" | Out-File -FilePath summary.md -Append -Encoding utf8
           "- Dependency Checked: $env:REPRO_DEPENDENCY_DLL" | Out-File -FilePath summary.md -Append -Encoding utf8
           "- Dependency Found In Package: $found" | Out-File -FilePath summary.md -Append -Encoding utf8
@@ -266,7 +316,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: repro-${{ matrix.image }}
+          name: repro-${{ matrix.image }}-sdk-${{ matrix.sdk_band }}
           if-no-files-found: warn
           path: |
             vs-instances.json
@@ -280,4 +330,4 @@ jobs:
         if: steps.verify.outputs.dependency_found != 'True'
         shell: pwsh
         run: |
-          throw "Dependency $env:REPRO_DEPENDENCY_DLL was not found in package on ${{ matrix.image }}"
+          throw "Dependency $env:REPRO_DEPENDENCY_DLL was not found in package on ${{ matrix.image }} (SDK band ${{ matrix.sdk_band }})"
