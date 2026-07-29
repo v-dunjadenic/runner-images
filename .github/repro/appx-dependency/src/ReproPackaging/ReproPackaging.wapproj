@@ -37,6 +37,5 @@
     <Content Include="Assets\Wide310x150Logo.png" />
   </ItemGroup>
 
-  <Import Project="$(WapProjPath)\Microsoft.DesktopBridge.props" />
   <Import Project="$(WapProjPath)\Microsoft.DesktopBridge.targets" />
 </Project>
