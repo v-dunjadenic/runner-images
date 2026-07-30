@@ -8,7 +8,7 @@ on:
       runners:
         description: 'JSON array of runner labels to test'
         required: false
-        default: '["ubuntu-22.04", "ubuntu-24.04", "ubuntu-24.04-arm", "ubuntu-26.04"]'
+        default: '["ubuntu-22.04", "ubuntu-22.04-arm", "ubuntu-24.04", "ubuntu-24.04-arm", "ubuntu-26.04"]'
 
 env:
   TEST_IMAGE: docker.io/library/alpine
@@ -22,7 +22,7 @@ jobs:
     steps:
       - id: runners
         env:
-          RUNNERS: ${{ inputs.runners || '["ubuntu-22.04", "ubuntu-24.04", "ubuntu-24.04-arm", "ubuntu-26.04"]' }}
+          RUNNERS: ${{ inputs.runners || '["ubuntu-22.04", "ubuntu-22.04-arm", "ubuntu-24.04", "ubuntu-24.04-arm", "ubuntu-26.04"]' }}
         run: echo "list=$RUNNERS" >> "$GITHUB_OUTPUT"
 
   # Rollout dependent: fails when this job happens to land on an affected image.
