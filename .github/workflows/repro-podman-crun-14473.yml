@@ -244,6 +244,7 @@ jobs:
       - name: Recreate the parts of the build environment the script relies on
         run: |
           echo 'APT::Get::Assume-Yes "true";' | sudo tee /etc/apt/apt.conf.d/90assumeyes
+          sudo chmod +x "$GITHUB_WORKSPACE/images/ubuntu/scripts/helpers/invoke-tests.sh"
           sudo ln -sf "$GITHUB_WORKSPACE/images/ubuntu/scripts/helpers/invoke-tests.sh" /usr/local/bin/invoke_tests
 
       - name: Run install-container-tools.sh
