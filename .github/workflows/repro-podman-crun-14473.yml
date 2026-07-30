@@ -263,13 +263,21 @@ jobs:
           sudo chmod +x /imagegeneration/helpers/invoke-tests.sh
           sudo ln -sf /imagegeneration/helpers/invoke-tests.sh /usr/local/bin/invoke_tests
 
+          sudo rm -f /dev/shm/libpod_lock /dev/shm/libpod_rootless_lock_*
+
       - name: Run install-container-tools.sh
         run: |
           set -o pipefail
-          sudo env HELPER_SCRIPTS=/imagegeneration/helpers \
+          sudo env -u XDG_RUNTIME_DIR \
+            HELPER_SCRIPTS=/imagegeneration/helpers \
             INSTALLER_SCRIPT_FOLDER=/imagegeneration/installers \
             DEBIAN_FRONTEND=noninteractive \
             bash images/ubuntu/scripts/build/install-container-tools.sh 2>&1 | tee -a "$VERIFY_LOG"
+
+      - name: Clear root-owned podman state before the rootless checks
+        run: |
+          runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+          sudo rm -rf "$runtime_dir/crun" "$runtime_dir/libpod"
 
       - name: Verify the runtime configuration
         run: |
