@@ -11,8 +11,8 @@ on:
         default: '["ubuntu-22.04", "ubuntu-24.04", "ubuntu-24.04-arm", "ubuntu-26.04"]'
 
 jobs:
-  repro:
-    name: Repro on ${{ matrix.runner }}
+  hosted-image:
+    name: Hosted image as-is on ${{ matrix.runner }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -69,7 +69,7 @@ jobs:
           path_crun=$(command -v crun || echo none)
 
           {
-            echo "### $RUNNER_LABEL (${ImageVersion:-unknown})"
+            echo "### Hosted image: $RUNNER_LABEL (${ImageVersion:-unknown})"
             echo ""
             echo "| Check | Value |"
             echo "| --- | --- |"
@@ -81,39 +81,145 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
           if [ "${{ steps.podman_run.outcome }}" = "failure" ] || [ "${{ steps.podman_build.outcome }}" = "failure" ]; then
-            echo "Issue #14473 reproduced on $RUNNER_LABEL: podman uses $runtime_path ($runtime_version)"
+            echo "REPRODUCED on $RUNNER_LABEL: podman uses $runtime_path ($runtime_version)"
             exit 1
           fi
 
-          echo "Not reproduced on $RUNNER_LABEL"
+          echo "NOT REPRODUCED on $RUNNER_LABEL: image ${ImageVersion:-unknown} is not the affected generation"
 
-  workaround:
-    name: Workaround on ${{ matrix.runner }}
+  # Deterministic: recreates the pairing that install-container-tools.sh produces
+  # (pinned podman 5.8.4 static bundle in /usr/local, distro crun left in /usr/bin),
+  # so it does not depend on which image generation the job lands on.
+  forced:
+    name: Forced ${{ matrix.mode }} on ${{ matrix.runner }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         runner: ${{ fromJSON(inputs.runners || '["ubuntu-22.04", "ubuntu-24.04", "ubuntu-24.04-arm", "ubuntu-26.04"]') }}
+        mode: [ as-built, with-fix ]
 
     env:
       RUNNER_LABEL: ${{ matrix.runner }}
+      MODE: ${{ matrix.mode }}
+      PODMAN_STATIC_TAG: v5.8.4
+      PODMAN_STATIC_SHA256_AMD64: a58765fe8be6ab3fb79f892f1a027b4ce4a7e8eb589df1ef960c167cbde08d69
+      PODMAN_STATIC_SHA256_ARM64: a2f6b73cc0f7018e2e8518338a4ec27db70148e1af86e16719235605aefd1df3
 
     steps:
-      - name: Point podman at the bundled crun
+      - name: Print image version
         run: |
-          if [ ! -x /usr/local/bin/crun ]; then
-            echo "/usr/local/bin/crun is not present on $RUNNER_LABEL, keeping the default runtime"
-            exit 0
+          echo "Image: ${ImageOS:-unknown} ${ImageVersion:-unknown} ($RUNNER_LABEL, mode $MODE)"
+
+      - name: Ensure the distro crun is present in /usr/bin
+        run: |
+          if [ ! -x /usr/bin/crun ]; then
+            sudo apt-get update
+            sudo apt-get install -y crun
           fi
+          echo "/usr/bin/crun -> $(/usr/bin/crun --version | head -1)"
+          dpkg -S /usr/bin/crun 2>/dev/null || echo "/usr/bin/crun not owned by an apt package"
+
+      - name: Install the pinned podman static bundle
+        run: |
+          case "$(uname -m)" in
+            x86_64)  arch=amd64; checksum=$PODMAN_STATIC_SHA256_AMD64 ;;
+            aarch64) arch=arm64; checksum=$PODMAN_STATIC_SHA256_ARM64 ;;
+            *) echo "unsupported architecture $(uname -m)"; exit 1 ;;
+          esac
+
+          archive="podman-linux-${arch}.tar.gz"
+          curl --fail --silent --show-error --location --retry 3 --output "$archive" \
+            "https://github.com/mgoltzsche/podman-static/releases/download/${PODMAN_STATIC_TAG}/${archive}"
+          echo "${checksum}  ${archive}" | sha256sum --check
+
+          sudo tar -xzf "$archive" -C / --strip-components=1 \
+            "podman-linux-${arch}/usr" "podman-linux-${arch}/etc"
+          rm -f "$archive"
+
+          # Same AppArmor profile the build script installs, otherwise rootless podman
+          # from /usr/local/bin fails with "failed to reexec: Permission denied".
+          if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null)" = "1" ]; then
+            sudo tee /etc/apparmor.d/podman > /dev/null <<'PROFILE'
+          abi <abi/4.0>,
+          include <tunables/global>
+
+          profile podman /usr/{bin,local/bin}/podman flags=(unconfined) {
+            userns,
+
+            include if exists <local/podman>
+          }
+          PROFILE
+            sudo apparmor_parser -r -W /etc/apparmor.d/podman
+          fi
+
+          printf "[registries.search]\nregistries = ['docker.io', 'quay.io']\n" | sudo tee /etc/containers/registries.conf
           sudo mkdir -p /etc/containers/containers.conf.d
+          printf '[network]\nfirewall_driver = "iptables"\n' | sudo tee /etc/containers/containers.conf.d/99-fix-firewall.conf
+
+      - name: Apply candidate fix - pin the runtime to the bundled crun
+        if: matrix.mode == 'with-fix'
+        run: |
           printf '[engine]\nruntime = "crun"\n\n[engine.runtimes]\ncrun = ["/usr/local/bin/crun"]\n' \
             | sudo tee /etc/containers/containers.conf.d/99-crun-path.conf
-          podman info --format 'OCI runtime: {{.Host.OCIRuntime.Path}} {{.Host.OCIRuntime.Version}}'
 
-      - name: Verify podman run
+      - name: Collect podman and crun diagnostics
+        run: |
+          podman --version
+          podman info --format 'OCI runtime: {{.Host.OCIRuntime.Name}} {{.Host.OCIRuntime.Path}} {{.Host.OCIRuntime.Version}}'
+          for binary in /usr/bin/crun /usr/local/bin/crun /usr/local/libexec/podman/crun; do
+            if [ -x "$binary" ]; then
+              echo "$binary -> $("$binary" --version | head -1)"
+            else
+              echo "$binary -> not present"
+            fi
+          done
+          echo "crun on PATH: $(command -v crun || echo none)"
+
+      - name: Reproduce - podman run
+        id: podman_run
+        continue-on-error: true
         run: podman run --rm docker.io/library/alpine echo hello
 
-      - name: Verify podman build
+      - name: Reproduce - podman build
+        id: podman_build
+        continue-on-error: true
         run: |
           printf 'FROM docker.io/library/alpine\nRUN echo hello\n' > Containerfile
-          podman build --tag repro-14473-workaround .
+          podman build --tag "repro-14473-$MODE" .
+
+      - name: Report result
+        run: |
+          runtime_path=$(podman info --format '{{.Host.OCIRuntime.Path}}')
+          runtime_version=$("$runtime_path" --version | head -1)
+          failed=no
+          if [ "${{ steps.podman_run.outcome }}" = "failure" ] || [ "${{ steps.podman_build.outcome }}" = "failure" ]; then
+            failed=yes
+          fi
+
+          {
+            echo "### Forced $MODE: $RUNNER_LABEL (${ImageVersion:-unknown})"
+            echo ""
+            echo "| Check | Value |"
+            echo "| --- | --- |"
+            echo "| podman | $(podman --version) |"
+            echo "| runtime selected by podman | $runtime_path ($runtime_version) |"
+            echo "| /usr/bin/crun | $(/usr/bin/crun --version | head -1) |"
+            echo "| podman run | ${{ steps.podman_run.outcome }} |"
+            echo "| podman build | ${{ steps.podman_build.outcome }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$MODE" = "as-built" ]; then
+            if [ "$failed" = "yes" ]; then
+              echo "REPRODUCED on $RUNNER_LABEL: podman uses $runtime_path ($runtime_version)"
+              exit 1
+            fi
+            echo "NOT REPRODUCED on $RUNNER_LABEL: $runtime_path is $runtime_version, which accepts ociVersion 1.2.1"
+            exit 0
+          fi
+
+          if [ "$failed" = "yes" ]; then
+            echo "FIX FAILED on $RUNNER_LABEL: podman still uses $runtime_path ($runtime_version)"
+            exit 1
+          fi
+          echo "FIX HOLDS on $RUNNER_LABEL: podman uses $runtime_path ($runtime_version)"
