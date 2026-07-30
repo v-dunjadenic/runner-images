@@ -243,35 +243,91 @@ jobs:
 
       - name: Recreate the parts of the build environment the script relies on
         run: |
+          echo "VERIFY_LOG=$RUNNER_TEMP/verify-14473.log" >> "$GITHUB_ENV"
           echo 'APT::Get::Assume-Yes "true";' | sudo tee /etc/apt/apt.conf.d/90assumeyes
-          sudo chmod +x "$GITHUB_WORKSPACE/images/ubuntu/scripts/helpers/invoke-tests.sh"
-          sudo ln -sf "$GITHUB_WORKSPACE/images/ubuntu/scripts/helpers/invoke-tests.sh" /usr/local/bin/invoke_tests
+
+          # Invoke-PesterTests only ever loads /imagegeneration/tests, and the hosted
+          # image ships its own copy of the tests and helpers, so stage this branch
+          # over them. Get-ToolsetContent needs INSTALLER_SCRIPT_FOLDER/toolset.json.
+          release=$(lsb_release -rs | tr -d '.')
+          arch_suffix=""
+          if [ "$(uname -m)" = "aarch64" ]; then
+            arch_suffix="-arm64"
+          fi
+
+          sudo mkdir -p /imagegeneration/tests /imagegeneration/helpers /imagegeneration/installers
+          sudo cp images/ubuntu/scripts/tests/* /imagegeneration/tests/
+          sudo cp images/ubuntu/scripts/helpers/* /imagegeneration/helpers/
+          sudo cp "images/ubuntu/toolsets/toolset-${release}${arch_suffix}.json" /imagegeneration/installers/toolset.json
+
+          sudo chmod +x /imagegeneration/helpers/invoke-tests.sh
+          sudo ln -sf /imagegeneration/helpers/invoke-tests.sh /usr/local/bin/invoke_tests
 
       - name: Run install-container-tools.sh
         run: |
-          sudo env HELPER_SCRIPTS="$GITHUB_WORKSPACE/images/ubuntu/scripts/helpers" \
+          set -o pipefail
+          sudo env HELPER_SCRIPTS=/imagegeneration/helpers \
+            INSTALLER_SCRIPT_FOLDER=/imagegeneration/installers \
             DEBIAN_FRONTEND=noninteractive \
-            bash images/ubuntu/scripts/build/install-container-tools.sh
+            bash images/ubuntu/scripts/build/install-container-tools.sh 2>&1 | tee -a "$VERIFY_LOG"
 
       - name: Verify the runtime configuration
         run: |
-          if [ -f /etc/containers/containers.conf.d/99-fix-runtime.conf ]; then
-            cat /etc/containers/containers.conf.d/99-fix-runtime.conf
-          else
-            echo "no runtime drop-in on $RUNNER_LABEL (expected on Ubuntu 26.04)"
-          fi
-          podman info --format 'OCI runtime: {{.Host.OCIRuntime.Path}} {{.Host.OCIRuntime.Version}}'
+          set -o pipefail
+          {
+            if [ -f /etc/containers/containers.conf.d/99-fix-runtime.conf ]; then
+              cat /etc/containers/containers.conf.d/99-fix-runtime.conf
+            else
+              echo "no runtime drop-in on $RUNNER_LABEL (expected on Ubuntu 26.04)"
+            fi
+            podman info --format 'OCI runtime: {{.Host.OCIRuntime.Path}} {{.Host.OCIRuntime.Version}}'
+          } 2>&1 | tee -a "$VERIFY_LOG"
 
       - name: Verify podman run
-        run: podman run --rm docker.io/library/alpine echo hello
+        run: |
+          set -o pipefail
+          podman run --rm docker.io/library/alpine echo hello 2>&1 | tee -a "$VERIFY_LOG"
 
       - name: Verify podman build
         run: |
-          printf 'FROM docker.io/library/alpine\nRUN echo hello\n' > Containerfile
-          podman build --tag verify-14473 .
+          set -o pipefail
+          printf 'FROM docker.io/library/alpine\nRUN echo hello\n' > "$RUNNER_TEMP/Containerfile"
+          podman build --tag verify-14473 --file "$RUNNER_TEMP/Containerfile" "$RUNNER_TEMP" 2>&1 | tee -a "$VERIFY_LOG"
 
       - name: Verify buildah still works
         run: |
-          container=$(buildah from docker.io/library/alpine)
-          buildah run "$container" -- echo hello
-          buildah rm "$container"
+          set -o pipefail
+          {
+            container=$(buildah from docker.io/library/alpine)
+            buildah run "$container" -- echo hello
+            buildah rm "$container"
+          } 2>&1 | tee -a "$VERIFY_LOG"
+
+      - name: Collect diagnostics
+        if: always()
+        run: |
+          {
+            echo "===== diagnostics ====="
+            echo "runner: $RUNNER_LABEL"
+            echo "image: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+            podman --version || true
+            buildah --version || true
+            podman info --format 'runtime: {{.Host.OCIRuntime.Path}} {{.Host.OCIRuntime.Version}}' || true
+            for binary in /usr/bin/crun /usr/local/bin/crun; do
+              if [ -x "$binary" ]; then
+                echo "$binary -> $("$binary" --version | head -1)"
+              else
+                echo "$binary -> not present"
+              fi
+            done
+            echo "----- containers.conf.d -----"
+            grep -r . /etc/containers/containers.conf.d 2>/dev/null || echo "none"
+          } >> "$VERIFY_LOG" 2>&1
+
+      - name: Upload verification log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-${{ matrix.runner }}
+          path: ${{ env.VERIFY_LOG }}
+          if-no-files-found: warn
