@@ -1,6 +1,8 @@
 name: Repro 14473 - podman/crun mismatch
 
 on:
+  push:
+    branches: [ test-podman-broken-on-20260726.254 ]
   workflow_dispatch:
     inputs:
       runners:
@@ -15,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: ${{ fromJSON(inputs.runners) }}
+        runner: ${{ fromJSON(inputs.runners || '["ubuntu-22.04", "ubuntu-24.04", "ubuntu-24.04-arm", "ubuntu-26.04"]') }}
 
     env:
       RUNNER_LABEL: ${{ matrix.runner }}
@@ -91,7 +93,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: ${{ fromJSON(inputs.runners) }}
+        runner: ${{ fromJSON(inputs.runners || '["ubuntu-22.04", "ubuntu-24.04", "ubuntu-24.04-arm", "ubuntu-26.04"]') }}
 
     env:
       RUNNER_LABEL: ${{ matrix.runner }}
