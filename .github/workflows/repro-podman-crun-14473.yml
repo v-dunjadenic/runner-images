@@ -10,240 +10,70 @@ on:
         required: false
         default: '["ubuntu-22.04", "ubuntu-24.04", "ubuntu-24.04-arm", "ubuntu-26.04"]'
 
+env:
+  TEST_IMAGE: docker.io/library/alpine
+
 jobs:
+  config:
+    name: Resolve runner list
+    runs-on: ubuntu-latest
+    outputs:
+      runners: ${{ steps.runners.outputs.list }}
+    steps:
+      - id: runners
+        env:
+          RUNNERS: ${{ inputs.runners || '["ubuntu-22.04", "ubuntu-24.04", "ubuntu-24.04-arm", "ubuntu-26.04"]' }}
+        run: echo "list=$RUNNERS" >> "$GITHUB_OUTPUT"
+
+  # Rollout dependent: fails when this job happens to land on an affected image.
   hosted-image:
-    name: Hosted image as-is on ${{ matrix.runner }}
+    name: Hosted image on ${{ matrix.runner }}
+    needs: config
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        runner: ${{ fromJSON(inputs.runners || '["ubuntu-22.04", "ubuntu-24.04", "ubuntu-24.04-arm", "ubuntu-26.04"]') }}
-
-    env:
-      RUNNER_LABEL: ${{ matrix.runner }}
+        runner: ${{ fromJSON(needs.config.outputs.runners) }}
 
     steps:
-      - name: Print image version
+      - name: Show what the image ships
         run: |
-          echo "Runner label: $RUNNER_LABEL"
-          echo "Image: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
-          cat /imagegeneration/imagedata.json 2>/dev/null || echo "imagedata.json not available"
-
-      - name: Collect podman and crun diagnostics
-        run: |
+          echo "image: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
           podman --version
-          podman info --format 'OCI runtime: {{.Host.OCIRuntime.Name}} {{.Host.OCIRuntime.Path}} {{.Host.OCIRuntime.Version}}'
-
-          echo "crun on PATH: $(command -v crun || echo none)"
-          for binary in /usr/bin/crun /usr/local/bin/crun /usr/bin/runc /usr/local/bin/runc; do
-            if [ -x "$binary" ]; then
-              echo "$binary -> $("$binary" --version | head -1)"
-            else
-              echo "$binary -> not present"
-            fi
+          podman info --format 'runtime: {{.Host.OCIRuntime.Path}}'
+          for binary in /usr/bin/crun /usr/local/bin/crun; do
+            [ -x "$binary" ] && echo "$binary -> $("$binary" --version | head -1)" || echo "$binary -> not present"
           done
 
-          echo "Owner of /usr/bin/crun:"
-          dpkg -S /usr/bin/crun 2>/dev/null || echo "not owned by an apt package"
+      - name: Run a container
+        run: podman run --rm "$TEST_IMAGE" echo hello
 
-          echo "containers.conf drop-ins:"
-          ls -la /etc/containers/containers.conf.d 2>/dev/null || echo "none"
-          grep -rn 'runtime' /etc/containers/containers.conf /etc/containers/containers.conf.d 2>/dev/null || echo "no runtime overrides"
-
-      - name: Reproduce - podman run
-        id: podman_run
-        continue-on-error: true
-        run: podman run --rm docker.io/library/alpine echo hello
-
-      - name: Reproduce - podman build
-        id: podman_build
-        continue-on-error: true
-        run: |
-          printf 'FROM docker.io/library/alpine\nRUN echo hello\n' > Containerfile
-          podman build --tag repro-14473 .
-
-      - name: Report result
-        run: |
-          runtime_path=$(podman info --format '{{.Host.OCIRuntime.Path}}')
-          runtime_version=$("$runtime_path" --version | head -1)
-          path_crun=$(command -v crun || echo none)
-
-          {
-            echo "### Hosted image: $RUNNER_LABEL (${ImageVersion:-unknown})"
-            echo ""
-            echo "| Check | Value |"
-            echo "| --- | --- |"
-            echo "| podman | $(podman --version) |"
-            echo "| runtime selected by podman | $runtime_path ($runtime_version) |"
-            echo "| crun resolved via PATH | $path_crun |"
-            echo "| podman run | ${{ steps.podman_run.outcome }} |"
-            echo "| podman build | ${{ steps.podman_build.outcome }} |"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          if [ "${{ steps.podman_run.outcome }}" = "failure" ] || [ "${{ steps.podman_build.outcome }}" = "failure" ]; then
-            echo "REPRODUCED on $RUNNER_LABEL: podman uses $runtime_path ($runtime_version)"
-            exit 1
-          fi
-
-          echo "NOT REPRODUCED on $RUNNER_LABEL: image ${ImageVersion:-unknown} is not the affected generation"
-
-  # Deterministic: recreates the pairing that install-container-tools.sh produces
-  # (pinned podman 5.8.4 static bundle in /usr/local, distro crun left in /usr/bin),
-  # so it does not depend on which image generation the job lands on.
-  forced:
-    name: Forced ${{ matrix.mode }} on ${{ matrix.runner }}
+  # Runs the real build script from this branch, so it validates the committed change
+  # (including its Pester tests). Green means the bug reproduces without the runtime
+  # drop-in and is gone with it.
+  build-script:
+    name: Build script ${{ matrix.mode }} on ${{ matrix.runner }}
+    needs: config
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        runner: ${{ fromJSON(inputs.runners || '["ubuntu-22.04", "ubuntu-24.04", "ubuntu-24.04-arm", "ubuntu-26.04"]') }}
-        mode: [ as-built, with-fix ]
+        runner: ${{ fromJSON(needs.config.outputs.runners) }}
+        mode: [ before-fix, after-fix ]
+        # Ubuntu 26.04 keeps the apt podman/crun pair, so it has no drop-in to remove
+        exclude:
+          - runner: ubuntu-26.04
+            mode: before-fix
 
     env:
-      RUNNER_LABEL: ${{ matrix.runner }}
-      MODE: ${{ matrix.mode }}
-      PODMAN_STATIC_TAG: v5.8.4
-      PODMAN_STATIC_SHA256_AMD64: a58765fe8be6ab3fb79f892f1a027b4ce4a7e8eb589df1ef960c167cbde08d69
-      PODMAN_STATIC_SHA256_ARM64: a2f6b73cc0f7018e2e8518338a4ec27db70148e1af86e16719235605aefd1df3
-
-    steps:
-      - name: Print image version
-        run: |
-          echo "Image: ${ImageOS:-unknown} ${ImageVersion:-unknown} ($RUNNER_LABEL, mode $MODE)"
-
-      - name: Ensure the distro crun is present in /usr/bin
-        run: |
-          if [ ! -x /usr/bin/crun ]; then
-            sudo apt-get update
-            sudo apt-get install -y crun
-          fi
-          echo "/usr/bin/crun -> $(/usr/bin/crun --version | head -1)"
-          dpkg -S /usr/bin/crun 2>/dev/null || echo "/usr/bin/crun not owned by an apt package"
-
-      - name: Install the pinned podman static bundle
-        run: |
-          case "$(uname -m)" in
-            x86_64)  arch=amd64; checksum=$PODMAN_STATIC_SHA256_AMD64 ;;
-            aarch64) arch=arm64; checksum=$PODMAN_STATIC_SHA256_ARM64 ;;
-            *) echo "unsupported architecture $(uname -m)"; exit 1 ;;
-          esac
-
-          archive="podman-linux-${arch}.tar.gz"
-          curl --fail --silent --show-error --location --retry 3 --output "$archive" \
-            "https://github.com/mgoltzsche/podman-static/releases/download/${PODMAN_STATIC_TAG}/${archive}"
-          echo "${checksum}  ${archive}" | sha256sum --check
-
-          sudo tar -xzf "$archive" -C / --strip-components=1 \
-            "podman-linux-${arch}/usr" "podman-linux-${arch}/etc"
-          rm -f "$archive"
-
-          # Same AppArmor profile the build script installs, otherwise rootless podman
-          # from /usr/local/bin fails with "failed to reexec: Permission denied".
-          if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null)" = "1" ]; then
-            sudo tee /etc/apparmor.d/podman > /dev/null <<'PROFILE'
-          abi <abi/4.0>,
-          include <tunables/global>
-
-          profile podman /usr/{bin,local/bin}/podman flags=(unconfined) {
-            userns,
-
-            include if exists <local/podman>
-          }
-          PROFILE
-            sudo apparmor_parser -r -W /etc/apparmor.d/podman
-          fi
-
-          printf "[registries.search]\nregistries = ['docker.io', 'quay.io']\n" | sudo tee /etc/containers/registries.conf
-          sudo mkdir -p /etc/containers/containers.conf.d
-          printf '[network]\nfirewall_driver = "iptables"\n' | sudo tee /etc/containers/containers.conf.d/99-fix-firewall.conf
-
-      - name: Apply candidate fix - pin the runtime to the bundled crun
-        if: matrix.mode == 'with-fix'
-        run: |
-          printf '[engine]\nruntime = "crun"\n\n[engine.runtimes]\ncrun = ["/usr/local/bin/crun"]\n' \
-            | sudo tee /etc/containers/containers.conf.d/99-crun-path.conf
-
-      - name: Collect podman and crun diagnostics
-        run: |
-          podman --version
-          podman info --format 'OCI runtime: {{.Host.OCIRuntime.Name}} {{.Host.OCIRuntime.Path}} {{.Host.OCIRuntime.Version}}'
-          for binary in /usr/bin/crun /usr/local/bin/crun /usr/local/libexec/podman/crun; do
-            if [ -x "$binary" ]; then
-              echo "$binary -> $("$binary" --version | head -1)"
-            else
-              echo "$binary -> not present"
-            fi
-          done
-          echo "crun on PATH: $(command -v crun || echo none)"
-
-      - name: Reproduce - podman run
-        id: podman_run
-        continue-on-error: true
-        run: podman run --rm docker.io/library/alpine echo hello
-
-      - name: Reproduce - podman build
-        id: podman_build
-        continue-on-error: true
-        run: |
-          printf 'FROM docker.io/library/alpine\nRUN echo hello\n' > Containerfile
-          podman build --tag "repro-14473-$MODE" .
-
-      - name: Report result
-        run: |
-          runtime_path=$(podman info --format '{{.Host.OCIRuntime.Path}}')
-          runtime_version=$("$runtime_path" --version | head -1)
-          failed=no
-          if [ "${{ steps.podman_run.outcome }}" = "failure" ] || [ "${{ steps.podman_build.outcome }}" = "failure" ]; then
-            failed=yes
-          fi
-
-          {
-            echo "### Forced $MODE: $RUNNER_LABEL (${ImageVersion:-unknown})"
-            echo ""
-            echo "| Check | Value |"
-            echo "| --- | --- |"
-            echo "| podman | $(podman --version) |"
-            echo "| runtime selected by podman | $runtime_path ($runtime_version) |"
-            echo "| /usr/bin/crun | $(/usr/bin/crun --version | head -1) |"
-            echo "| podman run | ${{ steps.podman_run.outcome }} |"
-            echo "| podman build | ${{ steps.podman_build.outcome }} |"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          if [ "$MODE" = "as-built" ]; then
-            if [ "$failed" = "yes" ]; then
-              echo "REPRODUCED on $RUNNER_LABEL: podman uses $runtime_path ($runtime_version)"
-              exit 1
-            fi
-            echo "NOT REPRODUCED on $RUNNER_LABEL: $runtime_path is $runtime_version, which accepts ociVersion 1.2.1"
-            exit 0
-          fi
-
-          if [ "$failed" = "yes" ]; then
-            echo "FIX FAILED on $RUNNER_LABEL: podman still uses $runtime_path ($runtime_version)"
-            exit 1
-          fi
-          echo "FIX HOLDS on $RUNNER_LABEL: podman uses $runtime_path ($runtime_version)"
-
-  # Executes the real build script from this branch, so it validates the committed
-  # change (including its Pester tests) instead of a hand-written config.
-  verify-build-script:
-    name: Verify build script on ${{ matrix.runner }}
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: ${{ fromJSON(inputs.runners || '["ubuntu-22.04", "ubuntu-24.04", "ubuntu-24.04-arm", "ubuntu-26.04"]') }}
-
-    env:
-      RUNNER_LABEL: ${{ matrix.runner }}
+      LOG: /tmp/repro-14473.log
 
     steps:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Recreate the parts of the build environment the script relies on
+      - name: Stage the build environment
         run: |
-          echo "VERIFY_LOG=$RUNNER_TEMP/verify-14473.log" >> "$GITHUB_ENV"
           echo 'APT::Get::Assume-Yes "true";' | sudo tee /etc/apt/apt.conf.d/90assumeyes
 
           # Invoke-PesterTests only ever loads /imagegeneration/tests, and the hosted
@@ -263,6 +93,9 @@ jobs:
           sudo chmod +x /imagegeneration/helpers/invoke-tests.sh
           sudo ln -sf /imagegeneration/helpers/invoke-tests.sh /usr/local/bin/invoke_tests
 
+          # The hosted image already carries podman state created by its own older
+          # podman, which podman 5.8.4 cannot reuse ("failed to open 2048 locks
+          # in /libpod_lock: numerical result out of range").
           sudo rm -f /dev/shm/libpod_lock /dev/shm/libpod_rootless_lock_*
 
       - name: Run install-container-tools.sh
@@ -272,70 +105,57 @@ jobs:
             HELPER_SCRIPTS=/imagegeneration/helpers \
             INSTALLER_SCRIPT_FOLDER=/imagegeneration/installers \
             DEBIAN_FRONTEND=noninteractive \
-            bash images/ubuntu/scripts/build/install-container-tools.sh 2>&1 | tee -a "$VERIFY_LOG"
+            bash images/ubuntu/scripts/build/install-container-tools.sh 2>&1 | tee -a "$LOG"
 
-      - name: Clear root-owned podman state before the rootless checks
-        run: |
-          runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-          sudo rm -rf "$runtime_dir/crun" "$runtime_dir/libpod"
+      - name: Remove the runtime drop-in again
+        if: matrix.mode == 'before-fix'
+        run: sudo rm -f /etc/containers/containers.conf.d/99-fix-runtime.conf
 
-      - name: Verify the runtime configuration
-        run: |
-          set -o pipefail
-          {
-            if [ -f /etc/containers/containers.conf.d/99-fix-runtime.conf ]; then
-              cat /etc/containers/containers.conf.d/99-fix-runtime.conf
-            else
-              echo "no runtime drop-in on $RUNNER_LABEL (expected on Ubuntu 26.04)"
-            fi
-            podman info --format 'OCI runtime: {{.Host.OCIRuntime.Path}} {{.Host.OCIRuntime.Version}}'
-          } 2>&1 | tee -a "$VERIFY_LOG"
-
-      - name: Verify podman run
-        run: |
-          set -o pipefail
-          podman run --rm docker.io/library/alpine echo hello 2>&1 | tee -a "$VERIFY_LOG"
-
-      - name: Verify podman build
-        run: |
-          set -o pipefail
-          printf 'FROM docker.io/library/alpine\nRUN echo hello\n' > "$RUNNER_TEMP/Containerfile"
-          podman build --tag verify-14473 --file "$RUNNER_TEMP/Containerfile" "$RUNNER_TEMP" 2>&1 | tee -a "$VERIFY_LOG"
-
-      - name: Verify buildah still works
+      - name: Use podman and buildah
+        id: containers
+        continue-on-error: ${{ matrix.mode == 'before-fix' }}
         run: |
           set -o pipefail
           {
-            container=$(buildah from docker.io/library/alpine)
+            # the script ran as root, so drop the state it left in the user runtime dir
+            runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+            sudo rm -rf "$runtime_dir/crun" "$runtime_dir/libpod"
+
+            podman info --format 'runtime: {{.Host.OCIRuntime.Path}}'
+            podman run --rm "$TEST_IMAGE" echo hello
+
+            context=$(mktemp -d)
+            printf 'FROM %s\nRUN echo hello\n' "$TEST_IMAGE" > "$context/Containerfile"
+            podman build --tag repro-14473 "$context"
+
+            container=$(buildah from "$TEST_IMAGE")
             buildah run "$container" -- echo hello
             buildah rm "$container"
-          } 2>&1 | tee -a "$VERIFY_LOG"
+          } 2>&1 | tee -a "$LOG"
+
+      - name: Fail if containers worked without the fix
+        if: matrix.mode == 'before-fix' && steps.containers.outcome == 'success'
+        run: |
+          echo "podman worked without the runtime drop-in, the issue no longer reproduces"
+          exit 1
 
       - name: Collect diagnostics
         if: always()
         run: |
           {
-            echo "===== diagnostics ====="
-            echo "runner: $RUNNER_LABEL"
-            echo "image: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
-            podman --version || true
-            buildah --version || true
-            podman info --format 'runtime: {{.Host.OCIRuntime.Path}} {{.Host.OCIRuntime.Version}}' || true
+            echo "===== ${{ matrix.mode }} on ${ImageOS:-unknown} ${ImageVersion:-unknown} ====="
+            podman --version
+            buildah --version
+            podman info --format 'runtime: {{.Host.OCIRuntime.Path}} {{.Host.OCIRuntime.Version}}'
             for binary in /usr/bin/crun /usr/local/bin/crun; do
-              if [ -x "$binary" ]; then
-                echo "$binary -> $("$binary" --version | head -1)"
-              else
-                echo "$binary -> not present"
-              fi
+              [ -x "$binary" ] && echo "$binary -> $("$binary" --version | head -1)" || echo "$binary -> not present"
             done
-            echo "----- containers.conf.d -----"
-            grep -r . /etc/containers/containers.conf.d 2>/dev/null || echo "none"
-          } >> "$VERIFY_LOG" 2>&1
+            grep -r . /etc/containers/containers.conf.d || echo "no drop-ins"
+          } >> "$LOG" 2>&1 || true
 
-      - name: Upload verification log
+      - name: Upload log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: verify-${{ matrix.runner }}
-          path: ${{ env.VERIFY_LOG }}
-          if-no-files-found: warn
+          name: ${{ matrix.mode }}-${{ matrix.runner }}
+          path: ${{ env.LOG }}
