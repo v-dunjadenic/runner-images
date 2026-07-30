@@ -223,3 +223,54 @@ jobs:
             exit 1
           fi
           echo "FIX HOLDS on $RUNNER_LABEL: podman uses $runtime_path ($runtime_version)"
+
+  # Executes the real build script from this branch, so it validates the committed
+  # change (including its Pester tests) instead of a hand-written config.
+  verify-build-script:
+    name: Verify build script on ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(inputs.runners || '["ubuntu-22.04", "ubuntu-24.04", "ubuntu-24.04-arm", "ubuntu-26.04"]') }}
+
+    env:
+      RUNNER_LABEL: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Recreate the parts of the build environment the script relies on
+        run: |
+          echo 'APT::Get::Assume-Yes "true";' | sudo tee /etc/apt/apt.conf.d/90assumeyes
+          sudo ln -sf "$GITHUB_WORKSPACE/images/ubuntu/scripts/helpers/invoke-tests.sh" /usr/local/bin/invoke_tests
+
+      - name: Run install-container-tools.sh
+        run: |
+          sudo env HELPER_SCRIPTS="$GITHUB_WORKSPACE/images/ubuntu/scripts/helpers" \
+            DEBIAN_FRONTEND=noninteractive \
+            bash images/ubuntu/scripts/build/install-container-tools.sh
+
+      - name: Verify the runtime configuration
+        run: |
+          if [ -f /etc/containers/containers.conf.d/99-fix-runtime.conf ]; then
+            cat /etc/containers/containers.conf.d/99-fix-runtime.conf
+          else
+            echo "no runtime drop-in on $RUNNER_LABEL (expected on Ubuntu 26.04)"
+          fi
+          podman info --format 'OCI runtime: {{.Host.OCIRuntime.Path}} {{.Host.OCIRuntime.Version}}'
+
+      - name: Verify podman run
+        run: podman run --rm docker.io/library/alpine echo hello
+
+      - name: Verify podman build
+        run: |
+          printf 'FROM docker.io/library/alpine\nRUN echo hello\n' > Containerfile
+          podman build --tag verify-14473 .
+
+      - name: Verify buildah still works
+        run: |
+          container=$(buildah from docker.io/library/alpine)
+          buildah run "$container" -- echo hello
+          buildah rm "$container"

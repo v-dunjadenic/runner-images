@@ -323,6 +323,11 @@ Describe "Containers" {
         "podman network rm test-net" | Should -ReturnZeroExitCode
     }
 
+    # https://github.com/actions/runner-images/issues/14473
+    It "podman uses the crun shipped with the podman bundle" -Skip:(Test-IsUbuntu26) {
+        "podman info --format '{{.Host.OCIRuntime.Path}}'" | Should -OutputTextMatchingRegex "(?m)^/usr/local/bin/crun$"
+    }
+
 }
 
 Describe "nvm" {
