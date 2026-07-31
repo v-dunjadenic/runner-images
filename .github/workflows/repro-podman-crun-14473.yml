@@ -119,7 +119,7 @@ jobs:
 
       - name: Undo the fix - remove the crun runtime drop-in
         if: matrix.mode == 'before-fix'
-        run: sudo rm -f /etc/containers/containers.conf.d/99-fix-runtime.conf
+        run: sudo rm -f /etc/containers/containers.conf.d/00-fix-runtime.conf
 
       - name: Run podman and buildah workloads
         id: containers
