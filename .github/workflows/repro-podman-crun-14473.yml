@@ -269,3 +269,64 @@ jobs:
         with:
           name: 14477-${{ matrix.mode }}-${{ matrix.runner }}
           path: ${{ env.LOG }}
+
+  # ---------------------------------------------------------------------------
+  # 14478 - is "sudo timedatectl set-timezone -> Access denied" a symptom of the
+  # 14477 ownership change? This changes nothing but the ownership of /usr and
+  # /etc, so whatever it proves is caused by that alone.
+  # ---------------------------------------------------------------------------
+  timezone-14478:
+    name: 14478 timezone on ${{ matrix.runner }}
+    needs: config
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(needs.config.outputs.runners) }}
+
+    steps:
+      - name: Baseline - set the timezone with /usr and /etc owned by root
+        run: |
+          echo "image: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+          stat -c '%n -> %U:%G' /usr /etc
+          sudo timedatectl set-timezone America/New_York
+          timedatectl show --property=Timezone --value
+
+      - name: Reproduce the 14477 state - hand /usr and /etc to runner
+        run: |
+          sudo chown runner:runner /usr /etc
+          stat -c '%n -> %U:%G' /usr /etc
+
+      - name: Set the timezone again
+        id: broken
+        continue-on-error: true
+        run: |
+          sudo timedatectl set-timezone Europe/Belgrade
+          timedatectl show --property=Timezone --value
+
+      - name: Restore ownership and set the timezone once more
+        id: restored
+        continue-on-error: true
+        run: |
+          sudo chown root:root /usr /etc
+          stat -c '%n -> %U:%G' /usr /etc
+          sudo timedatectl set-timezone Europe/London
+          timedatectl show --property=Timezone --value
+
+      - name: Verdict
+        run: |
+          echo "with runner-owned /usr and /etc: ${{ steps.broken.outcome }}"
+          echo "after restoring root ownership:  ${{ steps.restored.outcome }}"
+
+          if [ "${{ steps.broken.outcome }}" = "failure" ] && [ "${{ steps.restored.outcome }}" = "success" ]; then
+            echo "CONFIRMED: 14478 is caused by the 14477 ownership change"
+            exit 0
+          fi
+
+          if [ "${{ steps.broken.outcome }}" = "success" ]; then
+            echo "NOT CONFIRMED: timedatectl works fine with runner-owned /usr and /etc, so 14478 has another cause"
+            exit 0
+          fi
+
+          echo "INCONCLUSIVE: timedatectl also failed after ownership was restored"
+          exit 1
