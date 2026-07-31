@@ -117,7 +117,7 @@ jobs:
             DEBIAN_FRONTEND=noninteractive \
             bash images/ubuntu/scripts/build/install-container-tools.sh 2>&1 | tee -a "$LOG"
 
-      - name: Undo the fix: remove the crun runtime drop-in
+      - name: Undo the fix - remove the crun runtime drop-in
         if: matrix.mode == 'before-fix'
         run: sudo rm -f /etc/containers/containers.conf.d/99-fix-runtime.conf
 
