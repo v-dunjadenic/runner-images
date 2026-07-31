@@ -159,3 +159,102 @@ jobs:
         with:
           name: ${{ matrix.mode }}-${{ matrix.runner }}
           path: ${{ env.LOG }}
+
+  # ---------------------------------------------------------------------------
+  # Separate concern: actions/runner-images#14477. The same tar extraction hands
+  # /usr and /etc to uid 1001 (runner) because the bundle is built on a runner.
+  # ---------------------------------------------------------------------------
+  ownership:
+    name: Ownership ${{ matrix.mode }} on ${{ matrix.runner }}
+    needs: config
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(needs.config.outputs.runners) }}
+        mode: [ before-fix, after-fix ]
+        # Ubuntu 26.04 never extracts the bundle, so there is nothing to un-fix
+        exclude:
+          - runner: ubuntu-26.04
+            mode: before-fix
+
+    env:
+      MODE: ${{ matrix.mode }}
+      LOG: /tmp/repro-14477.log
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Stage the build environment
+        run: |
+          echo 'APT::Get::Assume-Yes "true";' | sudo tee /etc/apt/apt.conf.d/90assumeyes
+
+          release=$(lsb_release -rs | tr -d '.')
+          arch_suffix=""
+          if [ "$(uname -m)" = "aarch64" ]; then
+            arch_suffix="-arm64"
+          fi
+
+          sudo mkdir -p /imagegeneration/tests /imagegeneration/helpers /imagegeneration/installers
+          sudo cp images/ubuntu/scripts/tests/* /imagegeneration/tests/
+          sudo cp images/ubuntu/scripts/helpers/* /imagegeneration/helpers/
+          sudo cp "images/ubuntu/toolsets/toolset-${release}${arch_suffix}.json" /imagegeneration/installers/toolset.json
+
+          sudo chmod +x /imagegeneration/helpers/invoke-tests.sh
+          sudo ln -sf /imagegeneration/helpers/invoke-tests.sh /usr/local/bin/invoke_tests
+          sudo rm -f /dev/shm/libpod_lock /dev/shm/libpod_rootless_lock_*
+
+      - name: Restore the pre-fix extraction
+        if: matrix.mode == 'before-fix'
+        run: |
+          sed -i 's/ --no-same-owner --no-overwrite-dir//' images/ubuntu/scripts/build/install-container-tools.sh
+          grep -n 'tar -xzf' images/ubuntu/scripts/build/install-container-tools.sh
+
+      - name: Ownership before the script runs
+        run: |
+          set -o pipefail
+          stat -c '%n -> %U:%G' /usr /etc /usr/local /usr/local/bin 2>&1 | tee -a "$LOG"
+
+      # The image tests run at the end of the script, so before-fix fails here by design
+      - name: Run install-container-tools.sh
+        continue-on-error: ${{ matrix.mode == 'before-fix' }}
+        run: |
+          set -o pipefail
+          sudo env -u XDG_RUNTIME_DIR \
+            HELPER_SCRIPTS=/imagegeneration/helpers \
+            INSTALLER_SCRIPT_FOLDER=/imagegeneration/installers \
+            DEBIAN_FRONTEND=noninteractive \
+            bash images/ubuntu/scripts/build/install-container-tools.sh 2>&1 | tee -a "$LOG"
+
+      - name: Check ownership
+        run: |
+          set -o pipefail
+          {
+            echo "===== $MODE on ${ImageOS:-unknown} ${ImageVersion:-unknown} ====="
+            stat -c '%n -> %U:%G' /usr /etc /usr/local /usr/local/bin /etc/containers
+          } 2>&1 | tee -a "$LOG"
+
+          non_root=$(stat -c '%U' /usr /etc /usr/local /usr/local/bin | grep -vc '^root$' || true)
+
+          if [ "$MODE" = "before-fix" ]; then
+            if [ "$non_root" -eq 0 ]; then
+              echo "ownership stayed root without the fix, the issue no longer reproduces"
+              exit 1
+            fi
+            echo "REPRODUCED: $non_root directories are no longer owned by root"
+            exit 0
+          fi
+
+          if [ "$non_root" -ne 0 ]; then
+            echo "FIX FAILED: $non_root directories are not owned by root"
+            exit 1
+          fi
+          echo "FIX HOLDS: /usr and /etc are still owned by root"
+
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ownership-${{ matrix.mode }}-${{ matrix.runner }}
+          path: ${{ env.LOG }}
