@@ -36,7 +36,7 @@ jobs:
         run: echo "list=$RUNNERS" >> "$GITHUB_OUTPUT"
 
   # 14473 - rollout dependent: fails when this job lands on an affected image.
-  hosted-image:
+  hosted-image-14473:
     name: 14473 hosted image on ${{ matrix.runner }}
     needs: config
     runs-on: ${{ matrix.runner }}
@@ -61,7 +61,7 @@ jobs:
   # 14473 - runs the fixed build script from this branch, so it validates the committed
   # change including its Pester test. Green means podman falls back to the distro crun
   # without the drop-in, and uses the bundled crun with it.
-  crun-runtime:
+  crun-runtime-14473:
     name: 14473 crun runtime ${{ matrix.mode }} on ${{ matrix.runner }}
     needs: config
     runs-on: ${{ matrix.runner }}
@@ -175,7 +175,7 @@ jobs:
   # runner, so its entries are owned by uid 1001 and root restores that onto /usr
   # and /etc. Green means ownership breaks without the flags and holds with them.
   # ---------------------------------------------------------------------------
-  ownership:
+  ownership-14477:
     name: 14477 ownership ${{ matrix.mode }} on ${{ matrix.runner }}
     needs: config
     runs-on: ${{ matrix.runner }}
