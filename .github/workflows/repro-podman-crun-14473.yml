@@ -1,4 +1,14 @@
-name: Repro 14473 - podman/crun mismatch
+# Reproduction and verification for the two regressions introduced by the podman
+# static bundle install (actions/runner-images#14412):
+#
+#   #14473 hosted image: Can the image this job lands on run a container at all ?
+#   #14473 crun runtime: Podman must use the bundled crun, not the distro one
+#   #14477 ownership: /usr and /etc must stay root-owned after the extraction
+#
+# before-fix legs undo the fix and are green when the bug reproduces.
+# after-fix legs run the script as committed and are green when it works.
+
+name: Repro 14473 and 14477 - Ubuntu podman bundle regressions
 
 on:
   push:
@@ -25,9 +35,9 @@ jobs:
           RUNNERS: ${{ inputs.runners || '["ubuntu-22.04", "ubuntu-22.04-arm", "ubuntu-24.04", "ubuntu-24.04-arm", "ubuntu-26.04"]' }}
         run: echo "list=$RUNNERS" >> "$GITHUB_OUTPUT"
 
-  # Rollout dependent: fails when this job happens to land on an affected image.
+  # 14473 - rollout dependent: fails when this job lands on an affected image.
   hosted-image:
-    name: Hosted image on ${{ matrix.runner }}
+    name: 14473 hosted image on ${{ matrix.runner }}
     needs: config
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -36,7 +46,7 @@ jobs:
         runner: ${{ fromJSON(needs.config.outputs.runners) }}
 
     steps:
-      - name: Show what the image ships
+      - name: Show podman and crun versions on the image
         run: |
           echo "image: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
           podman --version
@@ -45,14 +55,14 @@ jobs:
             [ -x "$binary" ] && echo "$binary -> $("$binary" --version | head -1)" || echo "$binary -> not present"
           done
 
-      - name: Run a container
+      - name: Run a container - fails on an affected image
         run: podman run --rm "$TEST_IMAGE" echo hello
 
-  # Runs the real build script from this branch, so it validates the committed change
-  # (including its Pester tests). Green means the bug reproduces without the runtime
-  # drop-in and is gone with it.
-  build-script:
-    name: Build script ${{ matrix.mode }} on ${{ matrix.runner }}
+  # 14473 - runs the fixed build script from this branch, so it validates the committed
+  # change including its Pester test. Green means podman falls back to the distro crun
+  # without the drop-in, and uses the bundled crun with it.
+  crun-runtime:
+    name: 14473 crun runtime ${{ matrix.mode }} on ${{ matrix.runner }}
     needs: config
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -107,11 +117,11 @@ jobs:
             DEBIAN_FRONTEND=noninteractive \
             bash images/ubuntu/scripts/build/install-container-tools.sh 2>&1 | tee -a "$LOG"
 
-      - name: Remove the runtime drop-in again
+      - name: Undo the fix: remove the crun runtime drop-in
         if: matrix.mode == 'before-fix'
         run: sudo rm -f /etc/containers/containers.conf.d/99-fix-runtime.conf
 
-      - name: Use podman and buildah
+      - name: Run podman and buildah workloads
         id: containers
         continue-on-error: ${{ matrix.mode == 'before-fix' }}
         run: |
@@ -133,7 +143,7 @@ jobs:
             buildah rm "$container"
           } 2>&1 | tee -a "$LOG"
 
-      - name: Fail if containers worked without the fix
+      - name: Assert the crun bug reproduces without the fix
         if: matrix.mode == 'before-fix' && steps.containers.outcome == 'success'
         run: |
           echo "podman worked without the runtime drop-in, the issue no longer reproduces"
@@ -157,15 +167,16 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.mode }}-${{ matrix.runner }}
+          name: 14473-${{ matrix.mode }}-${{ matrix.runner }}
           path: ${{ env.LOG }}
 
   # ---------------------------------------------------------------------------
-  # Separate concern: actions/runner-images#14477. The same tar extraction hands
-  # /usr and /etc to uid 1001 (runner) because the bundle is built on a runner.
+  # 14477 - separate defect from the same tar extraction: the archive is built on a
+  # runner, so its entries are owned by uid 1001 and root restores that onto /usr
+  # and /etc. Green means ownership breaks without the flags and holds with them.
   # ---------------------------------------------------------------------------
   ownership:
-    name: Ownership ${{ matrix.mode }} on ${{ matrix.runner }}
+    name: 14477 ownership ${{ matrix.mode }} on ${{ matrix.runner }}
     needs: config
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -205,13 +216,13 @@ jobs:
           sudo ln -sf /imagegeneration/helpers/invoke-tests.sh /usr/local/bin/invoke_tests
           sudo rm -f /dev/shm/libpod_lock /dev/shm/libpod_rootless_lock_*
 
-      - name: Restore the pre-fix extraction
+      - name: Undo the fix - drop the tar ownership flags
         if: matrix.mode == 'before-fix'
         run: |
           sed -i 's/ --no-same-owner --no-overwrite-dir//' images/ubuntu/scripts/build/install-container-tools.sh
           grep -n 'tar -xzf' images/ubuntu/scripts/build/install-container-tools.sh
 
-      - name: Ownership before the script runs
+      - name: Record ownership before extraction
         run: |
           set -o pipefail
           stat -c '%n -> %U:%G' /usr /etc /usr/local /usr/local/bin 2>&1 | tee -a "$LOG"
@@ -227,7 +238,7 @@ jobs:
             DEBIAN_FRONTEND=noninteractive \
             bash images/ubuntu/scripts/build/install-container-tools.sh 2>&1 | tee -a "$LOG"
 
-      - name: Check ownership
+      - name: Assert /usr and /etc ownership
         run: |
           set -o pipefail
           {
@@ -256,5 +267,5 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ownership-${{ matrix.mode }}-${{ matrix.runner }}
+          name: 14477-${{ matrix.mode }}-${{ matrix.runner }}
           path: ${{ env.LOG }}
