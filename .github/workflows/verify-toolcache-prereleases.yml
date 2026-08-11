@@ -118,3 +118,79 @@ jobs:
               Write-Host "Live Python 3.14.* selection is $($selectedPython.version)"
             }
           }
+
+      - name: Export verification artifacts
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $artifactPath = Join-Path $env:RUNNER_TEMP 'toolcache-prerelease-verification'
+          $manifestPath = Join-Path $artifactPath 'manifests'
+          $sourcePath = Join-Path $artifactPath 'source'
+          New-Item -ItemType Directory -Force -Path $manifestPath, $sourcePath | Out-Null
+
+          Copy-Item '.github/workflows/verify-toolcache-prereleases.yml' (Join-Path $sourcePath 'verify-toolcache-prereleases.yml')
+          Copy-Item 'images/ubuntu/scripts/build/Install-Toolset.ps1' (Join-Path $sourcePath 'ubuntu-Install-Toolset.ps1')
+          Copy-Item 'images/windows/scripts/build/Install-Toolset.ps1' (Join-Path $sourcePath 'windows-Install-Toolset.ps1')
+          Copy-Item 'images/macos/scripts/build/Install-Toolset.ps1' (Join-Path $sourcePath 'macos-Install-Toolset.ps1')
+
+          $manifestUrls = [ordered]@{
+            python = 'https://raw.githubusercontent.com/actions/python-versions/main/versions-manifest.json'
+            node = 'https://raw.githubusercontent.com/actions/node-versions/main/versions-manifest.json'
+            go = 'https://raw.githubusercontent.com/actions/go-versions/main/versions-manifest.json'
+          }
+
+          $report = [System.Collections.Generic.List[string]]::new()
+          $report.Add('# Toolcache prerelease verification')
+          $report.Add('')
+          $report.Add("- Workflow: $env:GITHUB_WORKFLOW")
+          $report.Add("- Run: $env:GITHUB_RUN_ID")
+          $report.Add("- Commit: $(git rev-parse HEAD)")
+          $report.Add("- Ref: $env:GITHUB_REF")
+          $report.Add("- Job: $env:GITHUB_JOB")
+          $report.Add('')
+
+          foreach ($manifest in $manifestUrls.GetEnumerator()) {
+            $manifestFile = Join-Path $manifestPath "$($manifest.Key)-versions-manifest.json"
+            $assets = Invoke-RestMethod $manifest.Value
+            $assets | ConvertTo-Json -Depth 20 | Set-Content -Encoding utf8 $manifestFile
+
+            $matchingVersions = @($assets | Where-Object { $_.version -like '*.*.*' })
+            $invalidVersions = @($matchingVersions | Where-Object { $_.version -as [version] -eq $null })
+            $report.Add("## $($manifest.Key)")
+            $report.Add('')
+            $report.Add("- Manifest: $($manifest.Value)")
+            $report.Add("- Three-part versions: $($matchingVersions.Count)")
+            $report.Add("- Non-System.Version entries: $($invalidVersions.Count)")
+
+            if ($invalidVersions.Count -gt 0) {
+              $report.Add('- Non-System.Version entries:')
+              foreach ($invalidVersion in $invalidVersions) {
+                $stableVersion = $invalidVersion.version -replace '-.*$', ''
+                $hasStableVersion = $null -ne ($assets | Where-Object { $_.version -eq $stableVersion } | Select-Object -First 1)
+                $report.Add("  - $($invalidVersion.version) (stable counterpart present: $hasStableVersion)")
+              }
+            }
+
+            if ($manifest.Key -eq 'python') {
+              $selectedPython = $assets |
+                Where-Object { ($_.version -like '3.14.*') -and ($_.version -as [version] -ne $null) } |
+                Select-Object -First 1
+              $selectedVersion = if ($null -eq $selectedPython) { '<none>' } else { $selectedPython.version }
+              $report.Add("- Parseable Python 3.14.* selection: $selectedVersion")
+            }
+
+            $report.Add('')
+          }
+
+          $report | Set-Content -Encoding utf8 (Join-Path $artifactPath 'verification-report.md')
+          git status --short | Set-Content -Encoding utf8 (Join-Path $artifactPath 'git-status.txt')
+
+      - name: Upload verification artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: toolcache-prerelease-verification-${{ github.run_id }}
+          path: ${{ runner.temp }}/toolcache-prerelease-verification
+          if-no-files-found: error
+          retention-days: 14
