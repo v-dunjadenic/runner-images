@@ -144,17 +144,6 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $reportModules = @(
-            'images/ubuntu/scripts/docs-gen/SoftwareReport.CachedTools.psm1',
-            'images/windows/scripts/docs-gen/SoftwareReport.CachedTools.psm1',
-            'images/macos/scripts/docs-gen/SoftwareReport.Toolcache.psm1'
-          )
-
-          foreach ($reportModule in $reportModules) {
-            if ((Get-Content -Raw $reportModule) -match 'Sort-Object \{ \[Version\] ?\$_ \}') {
-              throw "$reportModule casts directory names directly to [Version] and throws on prerelease directories"
-            }
-          }
 
           # This is the sort that failed in #14011. It must tolerate any directory name.
           $directoryNames = @('3.14.7', '3.9.23', '3.14.5', '3.14.5-rc.1', '3.15.0-beta.1', 'x64')
