@@ -1,0 +1,120 @@
+name: Verify toolcache prerelease filtering
+
+on:
+  push:
+    branches:
+      - test-14011-version-parsing-fix
+      
+permissions:
+  contents: read
+
+jobs:
+  verify-toolcache-filter:
+    name: Verify toolcache filter
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Verify installer implementations
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installerPaths = @(
+            'images/ubuntu/scripts/build/Install-Toolset.ps1',
+            'images/windows/scripts/build/Install-Toolset.ps1',
+            'images/macos/scripts/build/Install-Toolset.ps1'
+          )
+
+          foreach ($installerPath in $installerPaths) {
+            $installer = Get-Content -Raw $installerPath
+            if ($installer -notmatch '\$_\.version -as \[version\] -ne \$null') {
+              throw "$installerPath does not reject versions that cannot be parsed as System.Version"
+            }
+
+            if ($installer -match "-notmatch '-\[a-zA-Z\]'") {
+              throw "$installerPath still contains the incomplete prerelease regex"
+            }
+          }
+
+      - name: Verify prerelease selection edge cases
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          function Select-Asset($assets, $toolVersion) {
+            $assets |
+              Where-Object { ($_.version -like $toolVersion) -and ($_.version -as [version] -ne $null) } |
+              Select-Object -ExpandProperty files |
+              Where-Object { ($_.platform -eq 'linux') -and ($_.arch -eq 'x64') -and ($_.platform_version -eq '22.04') } |
+              Select-Object -First 1
+          }
+
+          function New-Asset($version, $platform = 'linux', $arch = 'x64', $platformVersion = '22.04') {
+            [pscustomobject] @{
+              version = $version
+              files = @([pscustomobject] @{
+                filename = "$version.tar.gz"
+                platform = $platform
+                arch = $arch
+                platform_version = $platformVersion
+              })
+            }
+          }
+
+          $cases = @(
+            @{ Name = 'RC before stable'; Versions = @('3.14.5-rc.1', '3.14.5'); Expected = '3.14.5' }
+            @{ Name = 'Beta before stable'; Versions = @('3.14.5-beta.1', '3.14.5'); Expected = '3.14.5' }
+            @{ Name = 'Alpha before stable'; Versions = @('3.14.5-alpha.1', '3.14.5'); Expected = '3.14.5' }
+            @{ Name = 'Numeric prerelease before stable'; Versions = @('3.14.5-0', '3.14.5'); Expected = '3.14.5' }
+            @{ Name = 'Numeric dotted prerelease before stable'; Versions = @('3.14.5-1.2', '3.14.5'); Expected = '3.14.5' }
+            @{ Name = 'Build metadata is rejected'; Versions = @('3.14.5+build.1', '3.14.5'); Expected = '3.14.5' }
+            @{ Name = 'Version with v prefix is rejected by System.Version'; Versions = @('v3.14.5', '3.14.5'); Expected = '3.14.5' }
+            @{ Name = 'Stable wildcard selects first stable version'; Versions = @('3.14.4', '3.14.5'); Expected = '3.14.4' }
+          )
+
+          foreach ($case in $cases) {
+            $assets = @($case.Versions | ForEach-Object { New-Asset $_ })
+            $selectedAsset = Select-Asset $assets '3.14.*'
+            if ($null -eq $selectedAsset -or $selectedAsset.filename -ne "$($case.Expected).tar.gz") {
+              $selected = if ($null -eq $selectedAsset) { '<none>' } else { $selectedAsset.filename }
+              throw "$($case.Name): expected $($case.Expected), selected $selected"
+            }
+          }
+
+      - name: Audit live versions manifests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $manifests = @(
+            'https://raw.githubusercontent.com/actions/python-versions/main/versions-manifest.json',
+            'https://raw.githubusercontent.com/actions/node-versions/main/versions-manifest.json',
+            'https://raw.githubusercontent.com/actions/go-versions/main/versions-manifest.json'
+          )
+
+          foreach ($manifestUrl in $manifests) {
+            $assets = Invoke-RestMethod $manifestUrl
+            $matchingVersions = @($assets | Where-Object { $_.version -like '*.*.*' })
+            $invalidVersions = @($matchingVersions | Where-Object { $_.version -as [version] -eq $null })
+
+            Write-Host "$manifestUrl contains $($matchingVersions.Count) three-part version entries and $($invalidVersions.Count) prerelease/non-System.Version entries"
+
+            foreach ($invalidVersion in $invalidVersions) {
+              $stableVersion = $invalidVersion.version -replace '-.*$', ''
+              if ($stableVersion -and ($assets | Where-Object { $_.version -eq $stableVersion })) {
+                Write-Host "Confirmed prerelease candidate is paired with stable version: $($invalidVersion.version) / $stableVersion"
+              }
+            }
+
+            if ($manifestUrl -like '*python-versions*') {
+              $selectedPython = $assets |
+                Where-Object { ($_.version -like '3.14.*') -and ($_.version -as [version] -ne $null) } |
+                Select-Object -First 1
+
+              if ($null -eq $selectedPython) {
+                throw 'The live Python manifest has no parseable 3.14.* version'
+              }
+
+              Write-Host "Live Python 3.14.* selection is $($selectedPython.version)"
+            }
+          }
