@@ -86,7 +86,9 @@ jobs:
       ITERATIONS: ${{ inputs.iterations || '40' }}
       EXEC_TIMEOUT: ${{ inputs.exec_timeout_seconds || '60' }}
       TEST_IMAGE: docker.io/library/ubuntu:24.04
+      DIND_IMAGE: docker.io/library/docker:dind
       CTR: repro14604
+      DIND: repro14604-dind
       NET: repro14604
       CONTAINERS: "3"
       STOP_FILE: /tmp/repro14604.stop
@@ -221,6 +223,12 @@ jobs:
             sudo timeout 30 "$PODMAN" ps -a        > "$d/ps.txt" 2>&1
             sudo ls -la /dev/shm                   > "$d/dev-shm.txt" 2>&1
             sudo dmesg --ctime 2>/dev/null | tail -n 100 > "$d/dmesg.txt" 2>&1
+            for c in $(seq 1 "$CONTAINERS") "dind"; do
+              name="$CTR-$c"
+              [[ "$c" == "dind" ]] && name="$DIND"
+              echo "--- $name execIDs: $(sudo timeout 30 "$PODMAN" inspect "$name" --format '{{len .ExecIDs}}' 2>&1)" >> "$d/exec-sessions.txt"
+            done
+            sudo timeout 30 "$PODMAN" exec "$DIND" cat /tmp/dockerd.log > "$d/dockerd.log" 2>&1
 
             # Destructive: force every podman to dump all goroutine stacks to
             # its own stderr, i.e. into diag/exec-N.log.
@@ -248,9 +256,23 @@ jobs:
           # exec: mount churn plus a fork storm, still running when the pair fires.
           churn='d=$(mktemp -d); mount -t tmpfs none "$d" 2>/dev/null; for k in $(seq 300); do (:) & done; wait; sleep 3; umount "$d" 2>/dev/null; rmdir "$d" 2>/dev/null'
 
+          # The real thing: restart dockerd inside the container immediately before
+          # exec'ing into that same container. This is the race the reporter
+          # identified in their own ADR as the trigger.
+          dockerd_restart='pkill -9 dockerd 2>/dev/null; rm -f /var/run/docker.pid; exec dockerd >/tmp/dockerd.log 2>&1'
+
+          # Host-side docker traffic, as the reporter runs alongside podman.
+          docker_noise() {
+            while [[ ! -e "$STOP_FILE" ]]; do
+              timeout 30 docker ps -a  >/dev/null 2>&1
+              timeout 30 docker images >/dev/null 2>&1
+              sleep 0.3
+            done
+          }
+
           fail_setup() {
             echo "::error::$1"
-            printf '{"arm":"%s","attempt":"%s","iterations":%s,"completed":0,"hung":false,"phase":"","setup_failed":true,"max_exec_seconds":0,"image_version":"%s"}\n' \
+            printf '{"arm":"%s","attempt":"%s","iterations":%s,"completed":0,"hung":false,"phase":"","setup_failed":true,"max_exec_seconds":0,"live_exec_sessions":0,"image_version":"%s"}\n' \
               "$ARM" "$ATTEMPT" "$ITERATIONS" "${ImageVersion:-unknown}" > diag/result.json
             exit 1
           }
@@ -258,21 +280,33 @@ jobs:
           rm -f "$STOP_FILE"
           sudo "$PODMAN" network create "$NET" >/dev/null 2>&1
           sudo timeout 300 "$PODMAN" pull -q "$TEST_IMAGE" || fail_setup "could not pull $TEST_IMAGE"
+          sudo timeout 300 "$PODMAN" pull -q "$DIND_IMAGE" || fail_setup "could not pull $DIND_IMAGE"
 
           for c in $(seq 1 "$CONTAINERS"); do
             sudo "$PODMAN" run -d --privileged --name "$CTR-$c" --network "$NET" \
               "$TEST_IMAGE" sleep infinity || fail_setup "could not start container $CTR-$c"
           done
 
+          sudo "$PODMAN" run -d --privileged --name "$DIND" --network "$NET" \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            "$DIND_IMAGE" sleep infinity || fail_setup "could not start container $DIND"
+
           noise &
           noise_pid=$!
+          docker_noise &
+          docker_noise_pid=$!
 
           for i in $(seq 1 "$ITERATIONS"); do
             rcfiles=()
 
+            # Detached sessions that never exit, so the container accumulates live
+            # exec sessions and conmons instead of cleaning up after every call.
             for c in $(seq 1 "$CONTAINERS"); do
+              sudo "$PODMAN" exec -d "$CTR-$c" sleep infinity  >/dev/null 2>&1
               sudo "$PODMAN" exec -d "$CTR-$c" bash -c "$churn" >/dev/null 2>&1
             done
+
+            sudo "$PODMAN" exec -d "$DIND" sh -c "$dockerd_restart" >/dev/null 2>&1
 
             for c in $(seq 1 "$CONTAINERS"); do
               log="diag/exec-$i-$c"
@@ -291,6 +325,21 @@ jobs:
               rcfiles+=("$log.a.rc" "$log.b.rc")
             done
 
+            log="diag/exec-$i-dind"
+            rm -f "$log.a.rc" "$log.b.rc"
+            (
+              start=$(date +%s)
+              printf 'export REPRO_ITER=%s\n' "$i" \
+                | sudo env GOTRACEBACK=all "$PODMAN" exec -i "$DIND" \
+                    sh -c 'cat > /etc/profile.local' > "$log.a.log" 2>&1
+              echo "$?" > "$log.a.rc"
+              sudo env GOTRACEBACK=all "$PODMAN" exec "$DIND" \
+                sh -c '. /etc/profile.local' > "$log.b.log" 2>&1
+              echo "$?" > "$log.b.rc"
+              echo "$(( $(date +%s) - start ))" >> diag/timings.txt
+            ) &
+            rcfiles+=("$log.a.rc" "$log.b.rc")
+
             if ! wait_all_or_hang "${rcfiles[@]}"; then
               hung=$i
               hung_phase="exec-pair"
@@ -302,14 +351,24 @@ jobs:
           done
 
           touch "$STOP_FILE"
-          wait "$noise_pid" 2>/dev/null || true
+          wait "$noise_pid" "$docker_noise_pid" 2>/dev/null || true
 
           max_exec=$(sort -n diag/timings.txt 2>/dev/null | tail -1)
           max_exec=${max_exec:-0}
 
-          printf '{"arm":"%s","attempt":"%s","iterations":%s,"completed":%s,"hung":%s,"phase":"%s","setup_failed":false,"max_exec_seconds":%s,"image_version":"%s"}\n' \
+          sessions=$(sudo timeout 30 "$PODMAN" inspect "$CTR-1" --format '{{len .ExecIDs}}' 2>/dev/null)
+          [[ "$sessions" =~ ^[0-9]+$ ]] || sessions=0
+
+          # Without this a green run is ambiguous: no hang, or the dockerd race
+          # never actually happened because nested dockerd failed to come up.
+          sudo timeout 30 "$PODMAN" exec "$DIND" sh -c 'pgrep -a dockerd; echo "--- dockerd.log"; tail -20 /tmp/dockerd.log' \
+            > diag/02-dockerd-state.txt 2>&1
+          if grep -q dockerd diag/02-dockerd-state.txt; then dockerd_running=true; else dockerd_running=false; fi
+          cat diag/02-dockerd-state.txt
+
+          printf '{"arm":"%s","attempt":"%s","iterations":%s,"completed":%s,"hung":%s,"phase":"%s","setup_failed":false,"max_exec_seconds":%s,"live_exec_sessions":%s,"dockerd_running":%s,"image_version":"%s"}\n' \
             "$ARM" "$ATTEMPT" "$ITERATIONS" "$completed" \
-            "$( ((hung > 0)) && echo true || echo false )" "$hung_phase" "$max_exec" "${ImageVersion:-unknown}" \
+            "$( ((hung > 0)) && echo true || echo false )" "$hung_phase" "$max_exec" "$sessions" "$dockerd_running" "${ImageVersion:-unknown}" \
             > diag/result.json
           cat diag/result.json
 
@@ -345,6 +404,7 @@ jobs:
           for c in $(seq 1 "$CONTAINERS"); do
             sudo timeout 60 "${PODMAN:-/usr/local/bin/podman}" rm -f "$CTR-$c" >/dev/null 2>&1
           done
+          sudo timeout 60 "${PODMAN:-/usr/local/bin/podman}" rm -f "$DIND" >/dev/null 2>&1
           sudo timeout 60 "${PODMAN:-/usr/local/bin/podman}" network rm -f "$NET" >/dev/null 2>&1
 
       - name: Fail the job when the hang reproduces
@@ -387,11 +447,11 @@ jobs:
             echo
             echo "<details><summary>Per job</summary>"
             echo
-            echo "| arm | attempt | image | hung at | phase | slowest exec | setup |"
-            echo "|---|---|---|---|---|---|---|"
+            echo "| arm | attempt | image | hung at | phase | slowest exec | live sessions | dockerd | setup |"
+            echo "|---|---|---|---|---|---|---|---|---|"
             jq -rs '
               sort_by(.arm, (.attempt | tonumber))[]
-              | "| \(.arm) | \(.attempt) | \(.image_version) | \(if .hung then "iteration \(.completed + 1)" else "-" end) | \(if (.phase // "") == "" then "-" else .phase end) | \(.max_exec_seconds // 0)s | \(if .setup_failed then "FAILED" else "ok" end) |"
+              | "| \(.arm) | \(.attempt) | \(.image_version) | \(if .hung then "iteration \(.completed + 1)" else "-" end) | \(if (.phase // "") == "" then "-" else .phase end) | \(.max_exec_seconds // 0)s | \(.live_exec_sessions // 0) | \(if .dockerd_running then "up" else "DOWN" end) | \(if .setup_failed then "FAILED" else "ok" end) |"
             ' results/*/result.json
             echo
             echo "</details>"
