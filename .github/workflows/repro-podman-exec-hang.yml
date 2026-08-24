@@ -104,6 +104,7 @@ jobs:
       - name: Record image and podman build metadata
         run: |
           set -uo pipefail
+          set +e
           mkdir -p diag
           {
             echo "===== image ====="
@@ -154,16 +155,17 @@ jobs:
 
       - name: Show podman under test
         run: |
-          set -uo pipefail
+          set -euo pipefail
           echo "PODMAN=$PODMAN"
           sudo "$PODMAN" --version
-          sudo timeout 60 "$PODMAN" info > diag/01-podman-info.txt 2>&1
+          sudo timeout 60 "$PODMAN" info > diag/01-podman-info.txt 2>&1 || true
           cat diag/01-podman-info.txt
 
       - name: Run reproduction
         id: repro
         run: |
           set -uo pipefail
+          set +e
 
           hung=0
           hung_phase=""
@@ -239,9 +241,15 @@ jobs:
           }
 
           rm -f "$STOP_FILE"
-          sudo "$PODMAN" network create "$NET" >/dev/null 2>&1 || true
-          sudo timeout 300 "$PODMAN" pull -q "$TEST_IMAGE"
-          sudo "$PODMAN" run -d --name "$CTR" --network "$NET" "$TEST_IMAGE" sleep infinity
+          sudo "$PODMAN" network create "$NET" >/dev/null 2>&1
+          if ! sudo timeout 300 "$PODMAN" pull -q "$TEST_IMAGE"; then
+            echo "::error::could not pull $TEST_IMAGE"
+            exit 1
+          fi
+          if ! sudo "$PODMAN" run -d --name "$CTR" --network "$NET" "$TEST_IMAGE" sleep infinity; then
+            echo "::error::could not start container $CTR"
+            exit 1
+          fi
 
           noise &
           noise_pid=$!
@@ -309,6 +317,7 @@ jobs:
         if: always()
         run: |
           set -uo pipefail
+          set +e
           touch "$STOP_FILE"
           sudo timeout 60 "${PODMAN:-/usr/local/bin/podman}" rm -f "$CTR" >/dev/null 2>&1 || true
           sudo timeout 60 "${PODMAN:-/usr/local/bin/podman}" network rm -f "$NET" >/dev/null 2>&1 || true
