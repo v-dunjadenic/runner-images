@@ -1,0 +1,361 @@
+name: Repro podman exec hang (#14604)
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_image:
+        description: Runner image to test
+        type: choice
+        default: ubuntu-24.04
+        options:
+          - ubuntu-24.04
+          - ubuntu-22.04
+          - ubuntu-latest
+      arms:
+        description: Which podman binaries to compare
+        type: choice
+        default: both
+        options:
+          - both
+          - bundle
+          - apt
+      attempts:
+        description: Parallel jobs per arm
+        type: string
+        default: '12'
+      iterations:
+        description: Exec pairs per job
+        type: string
+        default: '40'
+      exec_timeout_seconds:
+        description: Seconds before a single exec counts as hung
+        type: string
+        default: '60'
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: Plan matrix
+    runs-on: ubuntu-latest
+    outputs:
+      attempts: ${{ steps.matrix.outputs.attempts }}
+      arms: ${{ steps.matrix.outputs.arms }}
+    steps:
+      - name: Build matrix
+        id: matrix
+        env:
+          ATTEMPTS: ${{ inputs.attempts }}
+          ARMS: ${{ inputs.arms }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$ATTEMPTS" =~ ^[0-9]+$ ]] || (( ATTEMPTS < 1 || ATTEMPTS > 50 )); then
+            echo "::error::attempts must be an integer between 1 and 50"
+            exit 1
+          fi
+
+          case "$ARMS" in
+            bundle) arms='["bundle"]' ;;
+            apt)    arms='["apt"]' ;;
+            *)      arms='["bundle","apt"]' ;;
+          esac
+
+          {
+            echo "attempts=$(seq 1 "$ATTEMPTS" | jq -Rsc 'split("\n") | map(select(length > 0) | tonumber)')"
+            echo "arms=$arms"
+          } >> "$GITHUB_OUTPUT"
+
+  repro:
+    name: ${{ matrix.arm }} / attempt ${{ matrix.attempt }}
+    needs: plan
+    runs-on: ${{ inputs.runner_image }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        arm: ${{ fromJSON(needs.plan.outputs.arms) }}
+        attempt: ${{ fromJSON(needs.plan.outputs.attempts) }}
+    env:
+      ARM: ${{ matrix.arm }}
+      ATTEMPT: ${{ matrix.attempt }}
+      ITERATIONS: ${{ inputs.iterations }}
+      EXEC_TIMEOUT: ${{ inputs.exec_timeout_seconds }}
+      TEST_IMAGE: docker.io/library/ubuntu:24.04
+      CTR: repro14604
+      NET: repro14604
+      STOP_FILE: /tmp/repro14604.stop
+
+    steps:
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          for v in ITERATIONS EXEC_TIMEOUT; do
+            if [[ ! "${!v}" =~ ^[0-9]+$ ]]; then
+              echo "::error::$v must be an integer"
+              exit 1
+            fi
+          done
+
+      - name: Record image and podman build metadata
+        run: |
+          set -uo pipefail
+          mkdir -p diag
+          {
+            echo "===== image ====="
+            echo "ImageVersion=${ImageVersion:-unknown}"
+            cat /imagegeneration/imagedata.json 2>/dev/null
+            uname -a
+            echo
+            echo "===== podman binaries ====="
+            ls -l /usr/local/bin/podman /usr/bin/podman 2>&1
+            file /usr/local/bin/podman 2>&1
+            echo
+            echo "===== bundle build flags (Go buildinfo) ====="
+            strings -a /usr/local/bin/podman 2>/dev/null \
+              | grep -E '^(CGO_ENABLED=|-tags=|-ldflags=)' | sort -u
+            echo
+            echo "===== /etc/containers ====="
+            for f in /etc/containers/containers.conf /etc/containers/storage.conf; do
+              echo "--- $f"
+              grep -vE '^\s*#|^\s*$' "$f" 2>&1
+            done
+            echo "--- containers.conf.d"
+            for f in /etc/containers/containers.conf.d/*; do
+              echo "  # $f"
+              cat "$f" 2>&1
+            done
+          } > diag/00-environment.txt 2>&1
+          cat diag/00-environment.txt
+
+      - name: Select podman under test
+        run: |
+          set -euo pipefail
+          if [[ "$ARM" == "apt" ]]; then
+            # Keep the bundle's /etc/containers/* so the only variable is the binary.
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq \
+              -o Dpkg::Options::=--force-confdef \
+              -o Dpkg::Options::=--force-confold \
+              podman
+            sudo mv /usr/local/bin/podman /usr/local/bin/podman.disabled
+            # glibc and musl lay pthread_mutex_t out differently, so a store or
+            # lock segment written by the static bundle must not be reused here.
+            sudo rm -rf /var/lib/containers /var/run/containers
+            sudo rm -f /dev/shm/libpod_lock /dev/shm/libpod_rootless_lock_*
+            echo "PODMAN=/usr/bin/podman" >> "$GITHUB_ENV"
+          else
+            echo "PODMAN=/usr/local/bin/podman" >> "$GITHUB_ENV"
+          fi
+
+      - name: Show podman under test
+        run: |
+          set -uo pipefail
+          echo "PODMAN=$PODMAN"
+          sudo "$PODMAN" --version
+          sudo timeout 60 "$PODMAN" info > diag/01-podman-info.txt 2>&1
+          cat diag/01-podman-info.txt
+
+      - name: Run reproduction
+        id: repro
+        run: |
+          set -uo pipefail
+
+          hung=0
+          hung_phase=""
+          completed=0
+
+          # Poll for a completion marker instead of `kill -0`: the podman under
+          # test runs as root via sudo, so an unprivileged kill -0 returns EPERM
+          # and would be misread as "process exited".
+          wait_or_hang() {
+            local rcfile="$1" waited=0
+            while (( waited < EXEC_TIMEOUT )); do
+              [[ -s "$rcfile" ]] && return 0
+              sleep 1
+              waited=$(( waited + 1 ))
+            done
+            return 1
+          }
+
+          run_exec() {
+            local logfile="$1"
+            shift
+            rm -f "$logfile.rc"
+            (
+              sudo env GOTRACEBACK=all "$PODMAN" "$@" > "$logfile" 2>&1
+              echo "$?" > "$logfile.rc"
+            ) &
+          }
+
+          capture() {
+            local d="diag/hang-$1"
+            mkdir -p "$d"
+
+            # Non-destructive evidence first.
+            sudo ps -eLo pid,tid,ppid,stat,wchan:32,etimes,args > "$d/ps-threads.txt" 2>&1
+            for p in $(pgrep -x podman); do
+              {
+                echo "===== pid $p ====="
+                echo "cmdline: $(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)"
+                echo "wchan:   $(cat "/proc/$p/wchan" 2>/dev/null)"
+                echo "--- kernel stack"
+                sudo cat "/proc/$p/stack" 2>&1
+                echo "--- per-thread wchan"
+                for t in $(ls -1 "/proc/$p/task" 2>/dev/null); do
+                  echo "  tid $t state=$(awk '{print $3}' "/proc/$p/task/$t/stat" 2>/dev/null) wchan=$(cat "/proc/$p/task/$t/wchan" 2>/dev/null)"
+                done
+                echo
+              } >> "$d/podman-procs.txt" 2>&1
+            done
+
+            sudo timeout 30 "$PODMAN" system locks > "$d/system-locks.txt" 2>&1
+            sudo timeout 30 "$PODMAN" ps -a        > "$d/ps.txt" 2>&1
+            sudo ls -la /dev/shm                   > "$d/dev-shm.txt" 2>&1
+            sudo dmesg --ctime 2>/dev/null | tail -n 100 > "$d/dmesg.txt" 2>&1
+
+            # Destructive: force every podman to dump all goroutine stacks to
+            # its own stderr, i.e. into diag/exec-N.log.
+            sudo pkill -ABRT -x podman
+            sleep 3
+          }
+
+          # Background contention. The reporter's own workaround was to stop a
+          # concurrent container operation from racing the next exec, so keep
+          # other podman processes touching the same container throughout.
+          # `exec -d` is included because a detached session leaves an async
+          # cleanup that takes the container lock after podman has returned.
+          noise() {
+            while [[ ! -e "$STOP_FILE" ]]; do
+              sudo timeout 30 "$PODMAN" ps -a          >/dev/null 2>&1
+              sudo timeout 30 "$PODMAN" inspect "$CTR" >/dev/null 2>&1
+              sudo timeout 30 "$PODMAN" exec -d "$CTR" true >/dev/null 2>&1
+              sleep 0.1
+            done
+          }
+
+          rm -f "$STOP_FILE"
+          sudo "$PODMAN" network create "$NET" >/dev/null 2>&1 || true
+          sudo timeout 300 "$PODMAN" pull -q "$TEST_IMAGE"
+          sudo "$PODMAN" run -d --name "$CTR" --network "$NET" "$TEST_IMAGE" sleep infinity
+
+          noise &
+          noise_pid=$!
+
+          for i in $(seq 1 "$ITERATIONS"); do
+            log="diag/exec-$i-stdin.log"
+            printf 'export REPRO_ITER=%s\n' "$i" > /tmp/repro-profile
+            (
+              sudo env GOTRACEBACK=all "$PODMAN" exec -i "$CTR" \
+                bash --login -c 'cat > /etc/profile.local' < /tmp/repro-profile > "$log" 2>&1
+              echo "$?" > "$log.rc"
+            ) &
+            if ! wait_or_hang "$log.rc"; then
+              hung=$i
+              hung_phase="exec-with-stdin"
+              capture "$i-stdin"
+              break
+            fi
+
+            log="diag/exec-$i.log"
+            run_exec "$log" exec "$CTR" bash --login -c 'source /etc/profile.local'
+            if ! wait_or_hang "$log.rc"; then
+              hung=$i
+              hung_phase="exec-no-stdin"
+              capture "$i"
+              break
+            fi
+
+            completed=$i
+          done
+
+          touch "$STOP_FILE"
+          wait "$noise_pid" 2>/dev/null || true
+
+          printf '{"arm":"%s","attempt":"%s","iterations":%s,"completed":%s,"hung":%s,"phase":"%s","image_version":"%s"}\n' \
+            "$ARM" "$ATTEMPT" "$ITERATIONS" "$completed" \
+            "$( ((hung > 0)) && echo true || echo false )" "$hung_phase" "${ImageVersion:-unknown}" \
+            > diag/result.json
+          cat diag/result.json
+
+          if (( hung > 0 )); then
+            echo "hung=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "### Reproduced on \`$ARM\` (attempt $ATTEMPT)"
+              echo
+              echo "- image version: \`${ImageVersion:-unknown}\`"
+              echo "- hung at iteration **$hung** of $ITERATIONS, phase \`$hung_phase\`"
+              echo "- podman: \`$PODMAN\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "hung=false" >> "$GITHUB_OUTPUT"
+            echo "No hang on \`$ARM\` after $ITERATIONS iterations (attempt $ATTEMPT)." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: repro-${{ matrix.arm }}-${{ matrix.attempt }}
+          path: diag
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Clean up
+        if: always()
+        run: |
+          set -uo pipefail
+          touch "$STOP_FILE"
+          sudo timeout 60 "${PODMAN:-/usr/local/bin/podman}" rm -f "$CTR" >/dev/null 2>&1 || true
+          sudo timeout 60 "${PODMAN:-/usr/local/bin/podman}" network rm -f "$NET" >/dev/null 2>&1 || true
+
+      - name: Fail the job when the hang reproduces
+        if: steps.repro.outputs.hung == 'true'
+        run: |
+          echo "::error::podman exec hang reproduced on arm '$ARM'"
+          exit 1
+
+  summary:
+    name: Summary
+    needs: repro
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: repro-*
+          path: results
+
+      - name: Report hit rate
+        run: |
+          set -euo pipefail
+
+          if ! compgen -G 'results/*/result.json' > /dev/null; then
+            echo "No results were produced - every repro job failed before writing one." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          {
+            echo "## podman exec hang reproduction (#14604)"
+            echo
+            echo "| arm | jobs | hung | hit rate |"
+            echo "|---|---|---|---|"
+            jq -rs '
+              group_by(.arm)[]
+              | "| \(.[0].arm) | \(length) | \(map(select(.hung)) | length) | \(((map(select(.hung)) | length) / length * 100) | round)% |"
+            ' results/*/result.json
+            echo
+            echo "<details><summary>Per job</summary>"
+            echo
+            echo "| arm | attempt | image | hung at | phase |"
+            echo "|---|---|---|---|---|"
+            jq -rs '
+              sort_by(.arm, (.attempt | tonumber))[]
+              | "| \(.arm) | \(.attempt) | \(.image_version) | \(if .hung then "iteration \(.completed + 1)" else "-" end) | \(if (.phase // "") == "" then "-" else .phase end) |"
+            ' results/*/result.json
+            echo
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$GITHUB_STEP_SUMMARY"
