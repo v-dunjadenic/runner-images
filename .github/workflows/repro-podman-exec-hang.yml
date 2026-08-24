@@ -15,13 +15,15 @@ on:
           - ubuntu-22.04
           - ubuntu-latest
       arms:
-        description: Which podman binaries to compare
+        description: Which podman configuration to compare
         type: choice
-        default: both
+        default: all
         options:
+          - all
           - both
           - bundle
           - apt
+          - mixed
       attempts:
         description: Parallel jobs per arm
         type: string
@@ -50,7 +52,7 @@ jobs:
         id: matrix
         env:
           ATTEMPTS: ${{ inputs.attempts || '12' }}
-          ARMS: ${{ inputs.arms || 'both' }}
+          ARMS: ${{ inputs.arms || 'all' }}
         run: |
           set -euo pipefail
 
@@ -62,7 +64,9 @@ jobs:
           case "$ARMS" in
             bundle) arms='["bundle"]' ;;
             apt)    arms='["apt"]' ;;
-            *)      arms='["bundle","apt"]' ;;
+            mixed)  arms='["mixed"]' ;;
+            both)   arms='["bundle","apt"]' ;;
+            *)      arms='["bundle","apt","mixed"]' ;;
           esac
 
           {
@@ -158,6 +162,19 @@ jobs:
             sudo rm -rf /var/lib/containers /var/run/containers
             sudo rm -f /dev/shm/libpod_lock /dev/shm/libpod_rootless_lock_*
             echo "PODMAN=/usr/bin/podman" >> "$GITHUB_ENV"
+          elif [[ "$ARM" == "mixed" ]]; then
+            # What every reporter of #14604/#14605 actually has: apt podman installed
+            # alongside the bundle, so a glibc 4.9.3 and a musl 5.8.4 podman share
+            # /var/lib/containers and /dev/shm/libpod_lock. Nothing is moved or wiped
+            # here - the mix is the point. #14605 also activates podman.socket, which
+            # leaves a long-running API service holding the libpod runtime open.
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq \
+              -o Dpkg::Options::=--force-confdef \
+              -o Dpkg::Options::=--force-confold \
+              podman
+            sudo systemctl enable --now podman.socket || true
+            echo "PODMAN=/usr/local/bin/podman" >> "$GITHUB_ENV"
           else
             echo "PODMAN=/usr/local/bin/podman" >> "$GITHUB_ENV"
           fi
@@ -167,6 +184,14 @@ jobs:
           set -euo pipefail
           echo "PODMAN=$PODMAN"
           sudo "$PODMAN" --version
+          {
+            echo "sudo resolves podman to: $(sudo sh -c 'command -v podman' || true)"
+            echo "podman.socket: $(systemctl is-active podman.socket 2>&1 || true)"
+            echo "unit file: $(systemctl show -p FragmentPath --value podman.socket 2>&1 || true)"
+            ls -l /usr/bin/podman /usr/local/bin/podman 2>&1 || true
+            /usr/bin/podman --version 2>&1 || true
+          } > diag/03-podman-selection.txt 2>&1
+          cat diag/03-podman-selection.txt
           sudo timeout 60 "$PODMAN" info > diag/01-podman-info.txt 2>&1 || true
           cat diag/01-podman-info.txt
 
