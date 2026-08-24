@@ -17,13 +17,16 @@ on:
       arms:
         description: Which podman configuration to compare
         type: choice
-        default: all
+        default: isolate
         options:
+          - isolate
           - all
           - both
           - bundle
           - apt
           - mixed
+          - libpodconf
+          - aptnolibpod
       attempts:
         description: Parallel jobs per arm
         type: string
@@ -62,11 +65,14 @@ jobs:
           fi
 
           case "$ARMS" in
-            bundle) arms='["bundle"]' ;;
-            apt)    arms='["apt"]' ;;
-            mixed)  arms='["mixed"]' ;;
-            both)   arms='["bundle","apt"]' ;;
-            *)      arms='["bundle","apt","mixed"]' ;;
+            bundle)       arms='["bundle"]' ;;
+            apt)          arms='["apt"]' ;;
+            mixed)        arms='["mixed"]' ;;
+            libpodconf)   arms='["libpodconf"]' ;;
+            aptnolibpod)  arms='["aptnolibpod"]' ;;
+            both)         arms='["bundle","apt"]' ;;
+            all)          arms='["bundle","apt","mixed"]' ;;
+            *)            arms='["bundle","libpodconf","aptnolibpod"]' ;;
           esac
 
           {
@@ -178,6 +184,23 @@ jobs:
               podman
             sudo systemctl enable --now podman.socket || true
             echo "PODMAN=/usr/local/bin/podman" >> "$GITHUB_ENV"
+          elif [[ "$ARM" == "libpodconf" ]]; then
+            # The podman package is the only thing apt adds under /etc/containers:
+            # /etc/containers/libpod.conf, the pre-4.0 legacy config. Drop in just
+            # that file, without installing anything, to test it on its own.
+            d=$(mktemp -d)
+            ( cd "$d" && apt-get download podman >/dev/null && dpkg-deb -x podman_*.deb x )
+            sudo cp "$d/x/etc/containers/libpod.conf" /etc/containers/libpod.conf
+            echo "PODMAN=/usr/local/bin/podman" >> "$GITHUB_ENV"
+          elif [[ "$ARM" == "aptnolibpod" ]]; then
+            # Same install as `mixed`, then remove only libpod.conf again.
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq \
+              -o Dpkg::Options::=--force-confdef \
+              -o Dpkg::Options::=--force-confold \
+              podman
+            sudo rm -f /etc/containers/libpod.conf
+            echo "PODMAN=/usr/local/bin/podman" >> "$GITHUB_ENV"
           else
             echo "PODMAN=/usr/local/bin/podman" >> "$GITHUB_ENV"
           fi
@@ -201,10 +224,11 @@ jobs:
             echo "===== apparmor ====="
             sudo aa-status 2>&1 | head -40
           } > diag/04-post-setup.txt 2>&1
+          # A no-match grep exits 1, and the step's status is the last command's.
           echo '--- packages added by this arm ---'
-          grep '^>' diag/04-dpkg-diff.txt
+          grep '^>' diag/04-dpkg-diff.txt || echo '(none)'
           echo '--- config files added by this arm ---'
-          grep '^>' diag/04-conf-files-diff.txt
+          grep '^>' diag/04-conf-files-diff.txt || echo '(none)'
 
       - name: Show podman under test
         run: |
