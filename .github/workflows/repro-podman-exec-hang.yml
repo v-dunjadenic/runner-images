@@ -88,6 +88,7 @@ jobs:
       TEST_IMAGE: docker.io/library/ubuntu:24.04
       CTR: repro14604
       NET: repro14604
+      CONTAINERS: "3"
       STOP_FILE: /tmp/repro14604.stop
 
     steps:
@@ -137,13 +138,19 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "$ARM" == "apt" ]]; then
-            # Keep the bundle's /etc/containers/* so the only variable is the binary.
             sudo apt-get update -qq
             sudo apt-get install -y -qq \
               -o Dpkg::Options::=--force-confdef \
               -o Dpkg::Options::=--force-confold \
-              podman
+              podman conmon crun
             sudo mv /usr/local/bin/podman /usr/local/bin/podman.disabled
+            # podman's built-in conmon search list hits /usr/local/lib/podman/conmon
+            # (the bundle's static build) before /usr/bin/conmon, and 4.9.3 fails
+            # against it with "conmon failed: exit status 1". Pin both helpers to the
+            # apt-provided ones so this arm is a working glibc baseline.
+            sudo rm -f /etc/containers/containers.conf.d/00-fix-runtime.conf
+            printf '[engine]\nconmon_path = ["/usr/bin/conmon"]\n\n[engine.runtimes]\ncrun = ["/usr/bin/crun"]\n' \
+              | sudo tee /etc/containers/containers.conf.d/01-apt-control.conf >/dev/null
             # glibc and musl lay pthread_mutex_t out differently, so a store or
             # lock segment written by the static bundle must not be reused here.
             sudo rm -rf /var/lib/containers /var/run/containers
@@ -171,32 +178,27 @@ jobs:
           hung_phase=""
           completed=0
 
-          # Poll for a completion marker instead of `kill -0`: the podman under
+          # Poll for completion markers instead of `kill -0`: the podman under
           # test runs as root via sudo, so an unprivileged kill -0 returns EPERM
           # and would be misread as "process exited".
-          wait_or_hang() {
-            local rcfile="$1" waited=0
+          wait_all_or_hang() {
+            local waited=0 f missing
             while (( waited < EXEC_TIMEOUT )); do
-              [[ -s "$rcfile" ]] && return 0
+              missing=0
+              for f in "$@"; do
+                [[ -s "$f" ]] || missing=1
+              done
+              (( missing == 0 )) && return 0
               sleep 1
               waited=$(( waited + 1 ))
             done
             return 1
           }
 
-          run_exec() {
-            local logfile="$1"
-            shift
-            rm -f "$logfile.rc"
-            (
-              sudo env GOTRACEBACK=all "$PODMAN" "$@" > "$logfile" 2>&1
-              echo "$?" > "$logfile.rc"
-            ) &
-          }
-
           capture() {
             local d="diag/hang-$1"
             mkdir -p "$d"
+            ls -la diag | grep -E "exec-$1-" > "$d/outstanding.txt" 2>&1
 
             # Non-destructive evidence first.
             sudo ps -eLo pid,tid,ppid,stat,wchan:32,etimes,args > "$d/ps-threads.txt" 2>&1
@@ -233,47 +235,65 @@ jobs:
           # cleanup that takes the container lock after podman has returned.
           noise() {
             while [[ ! -e "$STOP_FILE" ]]; do
-              sudo timeout 30 "$PODMAN" ps -a          >/dev/null 2>&1
-              sudo timeout 30 "$PODMAN" inspect "$CTR" >/dev/null 2>&1
-              sudo timeout 30 "$PODMAN" exec -d "$CTR" true >/dev/null 2>&1
+              for c in $(seq 1 "$CONTAINERS"); do
+                sudo timeout 30 "$PODMAN" ps -a                 >/dev/null 2>&1
+                sudo timeout 30 "$PODMAN" inspect "$CTR-$c"     >/dev/null 2>&1
+                sudo timeout 30 "$PODMAN" exec -d "$CTR-$c" true >/dev/null 2>&1
+              done
               sleep 0.1
             done
           }
 
+          # Stand-in for the dockerd startup the reporter races against the next
+          # exec: mount churn plus a fork storm, still running when the pair fires.
+          churn='d=$(mktemp -d); mount -t tmpfs none "$d" 2>/dev/null; for k in $(seq 300); do (:) & done; wait; sleep 3; umount "$d" 2>/dev/null; rmdir "$d" 2>/dev/null'
+
+          fail_setup() {
+            echo "::error::$1"
+            printf '{"arm":"%s","attempt":"%s","iterations":%s,"completed":0,"hung":false,"phase":"","setup_failed":true,"max_exec_seconds":0,"image_version":"%s"}\n' \
+              "$ARM" "$ATTEMPT" "$ITERATIONS" "${ImageVersion:-unknown}" > diag/result.json
+            exit 1
+          }
+
           rm -f "$STOP_FILE"
           sudo "$PODMAN" network create "$NET" >/dev/null 2>&1
-          if ! sudo timeout 300 "$PODMAN" pull -q "$TEST_IMAGE"; then
-            echo "::error::could not pull $TEST_IMAGE"
-            exit 1
-          fi
-          if ! sudo "$PODMAN" run -d --name "$CTR" --network "$NET" "$TEST_IMAGE" sleep infinity; then
-            echo "::error::could not start container $CTR"
-            exit 1
-          fi
+          sudo timeout 300 "$PODMAN" pull -q "$TEST_IMAGE" || fail_setup "could not pull $TEST_IMAGE"
+
+          for c in $(seq 1 "$CONTAINERS"); do
+            sudo "$PODMAN" run -d --privileged --name "$CTR-$c" --network "$NET" \
+              "$TEST_IMAGE" sleep infinity || fail_setup "could not start container $CTR-$c"
+          done
 
           noise &
           noise_pid=$!
 
           for i in $(seq 1 "$ITERATIONS"); do
-            log="diag/exec-$i-stdin.log"
-            printf 'export REPRO_ITER=%s\n' "$i" > /tmp/repro-profile
-            (
-              sudo env GOTRACEBACK=all "$PODMAN" exec -i "$CTR" \
-                bash --login -c 'cat > /etc/profile.local' < /tmp/repro-profile > "$log" 2>&1
-              echo "$?" > "$log.rc"
-            ) &
-            if ! wait_or_hang "$log.rc"; then
-              hung=$i
-              hung_phase="exec-with-stdin"
-              capture "$i-stdin"
-              break
-            fi
+            rcfiles=()
 
-            log="diag/exec-$i.log"
-            run_exec "$log" exec "$CTR" bash --login -c 'source /etc/profile.local'
-            if ! wait_or_hang "$log.rc"; then
+            for c in $(seq 1 "$CONTAINERS"); do
+              sudo "$PODMAN" exec -d "$CTR-$c" bash -c "$churn" >/dev/null 2>&1
+            done
+
+            for c in $(seq 1 "$CONTAINERS"); do
+              log="diag/exec-$i-$c"
+              rm -f "$log.a.rc" "$log.b.rc"
+              (
+                start=$(date +%s)
+                printf 'export REPRO_ITER=%s\n' "$i" \
+                  | sudo env GOTRACEBACK=all "$PODMAN" exec -i "$CTR-$c" \
+                      bash --login -c 'cat > /etc/profile.local' > "$log.a.log" 2>&1
+                echo "$?" > "$log.a.rc"
+                sudo env GOTRACEBACK=all "$PODMAN" exec "$CTR-$c" \
+                  bash --login -c 'source /etc/profile.local' > "$log.b.log" 2>&1
+                echo "$?" > "$log.b.rc"
+                echo "$(( $(date +%s) - start ))" >> diag/timings.txt
+              ) &
+              rcfiles+=("$log.a.rc" "$log.b.rc")
+            done
+
+            if ! wait_all_or_hang "${rcfiles[@]}"; then
               hung=$i
-              hung_phase="exec-no-stdin"
+              hung_phase="exec-pair"
               capture "$i"
               break
             fi
@@ -284,9 +304,12 @@ jobs:
           touch "$STOP_FILE"
           wait "$noise_pid" 2>/dev/null || true
 
-          printf '{"arm":"%s","attempt":"%s","iterations":%s,"completed":%s,"hung":%s,"phase":"%s","image_version":"%s"}\n' \
+          max_exec=$(sort -n diag/timings.txt 2>/dev/null | tail -1)
+          max_exec=${max_exec:-0}
+
+          printf '{"arm":"%s","attempt":"%s","iterations":%s,"completed":%s,"hung":%s,"phase":"%s","setup_failed":false,"max_exec_seconds":%s,"image_version":"%s"}\n' \
             "$ARM" "$ATTEMPT" "$ITERATIONS" "$completed" \
-            "$( ((hung > 0)) && echo true || echo false )" "$hung_phase" "${ImageVersion:-unknown}" \
+            "$( ((hung > 0)) && echo true || echo false )" "$hung_phase" "$max_exec" "${ImageVersion:-unknown}" \
             > diag/result.json
           cat diag/result.json
 
@@ -319,8 +342,10 @@ jobs:
           set -uo pipefail
           set +e
           touch "$STOP_FILE"
-          sudo timeout 60 "${PODMAN:-/usr/local/bin/podman}" rm -f "$CTR" >/dev/null 2>&1 || true
-          sudo timeout 60 "${PODMAN:-/usr/local/bin/podman}" network rm -f "$NET" >/dev/null 2>&1 || true
+          for c in $(seq 1 "$CONTAINERS"); do
+            sudo timeout 60 "${PODMAN:-/usr/local/bin/podman}" rm -f "$CTR-$c" >/dev/null 2>&1
+          done
+          sudo timeout 60 "${PODMAN:-/usr/local/bin/podman}" network rm -f "$NET" >/dev/null 2>&1
 
       - name: Fail the job when the hang reproduces
         if: steps.repro.outputs.hung == 'true'
@@ -352,20 +377,21 @@ jobs:
           {
             echo "## podman exec hang reproduction (#14604)"
             echo
-            echo "| arm | jobs | hung | hit rate |"
-            echo "|---|---|---|---|"
+            echo "| arm | usable jobs | hung | hit rate | setup failed | slowest exec |"
+            echo "|---|---|---|---|---|---|"
             jq -rs '
               group_by(.arm)[]
-              | "| \(.[0].arm) | \(length) | \(map(select(.hung)) | length) | \(((map(select(.hung)) | length) / length * 100) | round)% |"
+              | (map(select(.setup_failed | not))) as $ok
+              | "| \(.[0].arm) | \($ok | length) | \($ok | map(select(.hung)) | length) | \(if ($ok | length) == 0 then "n/a" else ((($ok | map(select(.hung)) | length) / ($ok | length) * 100) | round | tostring) + "%" end) | \(map(select(.setup_failed)) | length) | \($ok | map(.max_exec_seconds // 0) | max // 0)s |"
             ' results/*/result.json
             echo
             echo "<details><summary>Per job</summary>"
             echo
-            echo "| arm | attempt | image | hung at | phase |"
-            echo "|---|---|---|---|---|"
+            echo "| arm | attempt | image | hung at | phase | slowest exec | setup |"
+            echo "|---|---|---|---|---|---|---|"
             jq -rs '
               sort_by(.arm, (.attempt | tonumber))[]
-              | "| \(.arm) | \(.attempt) | \(.image_version) | \(if .hung then "iteration \(.completed + 1)" else "-" end) | \(if (.phase // "") == "" then "-" else .phase end) |"
+              | "| \(.arm) | \(.attempt) | \(.image_version) | \(if .hung then "iteration \(.completed + 1)" else "-" end) | \(if (.phase // "") == "" then "-" else .phase end) | \(.max_exec_seconds // 0)s | \(if .setup_failed then "FAILED" else "ok" end) |"
             ' results/*/result.json
             echo
             echo "</details>"
