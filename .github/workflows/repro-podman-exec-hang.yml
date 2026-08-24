@@ -17,13 +17,16 @@ on:
       arms:
         description: Which podman configuration to compare
         type: choice
-        default: all
+        default: isolate
         options:
+          - isolate
           - all
           - both
           - bundle
           - apt
           - mixed
+          - aptonly
+          - socketonly
       attempts:
         description: Parallel jobs per arm
         type: string
@@ -52,7 +55,7 @@ jobs:
         id: matrix
         env:
           ATTEMPTS: ${{ inputs.attempts || '12' }}
-          ARMS: ${{ inputs.arms || 'all' }}
+          ARMS: ${{ inputs.arms || 'isolate' }}
         run: |
           set -euo pipefail
 
@@ -62,11 +65,14 @@ jobs:
           fi
 
           case "$ARMS" in
-            bundle) arms='["bundle"]' ;;
-            apt)    arms='["apt"]' ;;
-            mixed)  arms='["mixed"]' ;;
-            both)   arms='["bundle","apt"]' ;;
-            *)      arms='["bundle","apt","mixed"]' ;;
+            bundle)     arms='["bundle"]' ;;
+            apt)        arms='["apt"]' ;;
+            mixed)      arms='["mixed"]' ;;
+            aptonly)    arms='["aptonly"]' ;;
+            socketonly) arms='["socketonly"]' ;;
+            both)       arms='["bundle","apt"]' ;;
+            all)        arms='["bundle","apt","mixed"]' ;;
+            *)          arms='["bundle","aptonly","socketonly"]' ;;
           esac
 
           {
@@ -128,7 +134,7 @@ jobs:
               | grep -E '^(CGO_ENABLED=|-tags=|-ldflags=)' | sort -u
             echo
             echo "===== /etc/containers ====="
-            for f in /etc/containers/containers.conf /etc/containers/storage.conf; do
+            for f in /etc/containers/containers.conf /etc/containers/storage.conf /usr/share/containers/containers.conf; do
               echo "--- $f"
               grep -vE '^\s*#|^\s*$' "$f" 2>&1
             done
@@ -162,18 +168,21 @@ jobs:
             sudo rm -rf /var/lib/containers /var/run/containers
             sudo rm -f /dev/shm/libpod_lock /dev/shm/libpod_rootless_lock_*
             echo "PODMAN=/usr/bin/podman" >> "$GITHUB_ENV"
-          elif [[ "$ARM" == "mixed" ]]; then
+          elif [[ "$ARM" == "mixed" || "$ARM" == "aptonly" || "$ARM" == "socketonly" ]]; then
             # What every reporter of #14604/#14605 actually has: apt podman installed
-            # alongside the bundle, so a glibc 4.9.3 and a musl 5.8.4 podman share
-            # /var/lib/containers and /dev/shm/libpod_lock. Nothing is moved or wiped
-            # here - the mix is the point. #14605 also activates podman.socket, which
-            # leaves a long-running API service holding the libpod runtime open.
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq \
-              -o Dpkg::Options::=--force-confdef \
-              -o Dpkg::Options::=--force-confold \
-              podman
-            sudo systemctl enable --now podman.socket || true
+            # alongside the bundle, plus podman.socket enabled. `mixed` does both;
+            # aptonly/socketonly split them so the trigger can be attributed.
+            # Nothing is moved or wiped - the coexistence is the point.
+            if [[ "$ARM" != "socketonly" ]]; then
+              sudo apt-get update -qq
+              sudo apt-get install -y -qq \
+                -o Dpkg::Options::=--force-confdef \
+                -o Dpkg::Options::=--force-confold \
+                podman
+            fi
+            if [[ "$ARM" != "aptonly" ]]; then
+              sudo systemctl enable --now podman.socket || true
+            fi
             echo "PODMAN=/usr/local/bin/podman" >> "$GITHUB_ENV"
           else
             echo "PODMAN=/usr/local/bin/podman" >> "$GITHUB_ENV"
@@ -386,9 +395,13 @@ jobs:
 
           # Without this a green run is ambiguous: no hang, or the dockerd race
           # never actually happened because nested dockerd failed to come up.
-          sudo timeout 30 "$PODMAN" exec "$DIND" sh -c 'pgrep -a dockerd; echo "--- dockerd.log"; tail -20 /tmp/dockerd.log' \
+          sudo timeout 30 "$PODMAN" exec "$DIND" sh -c 'pgrep -a dockerd; echo "--- log"; tail -20 /tmp/dockerd.log' \
             > diag/02-dockerd-state.txt 2>&1
-          if grep -q dockerd diag/02-dockerd-state.txt; then dockerd_running=true; else dockerd_running=false; fi
+          if sudo timeout 30 "$PODMAN" exec "$DIND" pgrep -x dockerd >/dev/null 2>&1; then
+            dockerd_running=true
+          else
+            dockerd_running=false
+          fi
           cat diag/02-dockerd-state.txt
 
           printf '{"arm":"%s","attempt":"%s","iterations":%s,"completed":%s,"hung":%s,"phase":"%s","setup_failed":false,"max_exec_seconds":%s,"live_exec_sessions":%s,"dockerd_running":%s,"image_version":"%s"}\n' \
