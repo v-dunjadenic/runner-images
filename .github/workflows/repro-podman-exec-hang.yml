@@ -1,6 +1,9 @@
 name: Repro podman exec hang (#14604)
 
 on:
+  push:
+    branches:
+      - repro-14604-podman-exec-hang
   workflow_dispatch:
     inputs:
       runner_image:
@@ -22,15 +25,15 @@ on:
       attempts:
         description: Parallel jobs per arm
         type: string
-        default: '12'
+        default: "12"
       iterations:
         description: Exec pairs per job
         type: string
-        default: '40'
+        default: "40"
       exec_timeout_seconds:
         description: Seconds before a single exec counts as hung
         type: string
-        default: '60'
+        default: "60"
 
 permissions:
   contents: read
@@ -46,8 +49,8 @@ jobs:
       - name: Build matrix
         id: matrix
         env:
-          ATTEMPTS: ${{ inputs.attempts }}
-          ARMS: ${{ inputs.arms }}
+          ATTEMPTS: ${{ inputs.attempts || '12' }}
+          ARMS: ${{ inputs.arms || 'both' }}
         run: |
           set -euo pipefail
 
@@ -70,7 +73,7 @@ jobs:
   repro:
     name: ${{ matrix.arm }} / attempt ${{ matrix.attempt }}
     needs: plan
-    runs-on: ${{ inputs.runner_image }}
+    runs-on: ${{ inputs.runner_image || 'ubuntu-24.04' }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -80,8 +83,8 @@ jobs:
     env:
       ARM: ${{ matrix.arm }}
       ATTEMPT: ${{ matrix.attempt }}
-      ITERATIONS: ${{ inputs.iterations }}
-      EXEC_TIMEOUT: ${{ inputs.exec_timeout_seconds }}
+      ITERATIONS: ${{ inputs.iterations || '40' }}
+      EXEC_TIMEOUT: ${{ inputs.exec_timeout_seconds || '60' }}
       TEST_IMAGE: docker.io/library/ubuntu:24.04
       CTR: repro14604
       NET: repro14604
