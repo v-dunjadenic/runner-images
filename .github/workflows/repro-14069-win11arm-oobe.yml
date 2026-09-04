@@ -1,0 +1,197 @@
+name: Repro 14069 - Win11 ARM64 first-logon privacy OOBE
+
+# Throwaway harness for https://github.com/actions/runner-images/issues/14069
+# windows-2025 is the control arm: it already has the PrivacyConsent* fix, so it must come back clean.
+
+on:
+  workflow_dispatch:
+    inputs:
+      settle_seconds:
+        description: 'Seconds to wait between the two desktop captures'
+        default: '60'
+  # workflow_dispatch is only offered for workflows on the default branch, so allow push too.
+  push:
+    branches:
+      - repro-14069-win11arm-oobe
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    name: ${{ matrix.runner }} / attempt ${{ matrix.attempt }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-11-arm, windows-2025]
+        attempt: [1, 2, 3]
+
+    steps:
+      - name: Capture desktop state
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $out = Join-Path $env:RUNNER_TEMP 'repro'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          "OUT_DIR=$out" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          $sig = '
+          [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+          [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr hWnd, System.Text.StringBuilder lpString, int nMaxCount);
+          [DllImport("user32.dll")] public static extern int GetWindowThreadProcessId(IntPtr hWnd, out int lpdwProcessId);
+          '
+          Add-Type -MemberDefinition $sig -Name Fg -Namespace Native | Out-Null
+
+          function Get-DesktopState {
+            param([string] $Label)
+
+            $lines = @("=== capture: $Label  ($(Get-Date -Format o)) ===")
+
+            $handle = [Native.Fg]::GetForegroundWindow()
+            $title = New-Object System.Text.StringBuilder 512
+            [void][Native.Fg]::GetWindowTextW($handle, $title, $title.Capacity)
+            $ownerId = 0
+            [void][Native.Fg]::GetWindowThreadProcessId($handle, [ref] $ownerId)
+            $owner = (Get-Process -Id $ownerId -ErrorAction SilentlyContinue).ProcessName
+            $lines += "foreground_hwnd   : $handle"
+            $lines += "foreground_title  : $($title.ToString())"
+            $lines += "foreground_process: $owner (pid $ownerId)"
+
+            $lines += '--- visible top-level windows ---'
+            $windows = Get-Process -ErrorAction SilentlyContinue |
+              Where-Object { $_.MainWindowHandle -ne 0 } |
+              Sort-Object ProcessName
+            if ($windows) {
+              foreach ($w in $windows) { $lines += "  $($w.ProcessName) [$($w.Id)] : $($w.MainWindowTitle)" }
+            } else {
+              $lines += '  (none)'
+            }
+
+            $lines += '--- suspect processes ---'
+            $suspects = 'WWAHost', 'CloudExperienceHostBroker', 'SystemSettings', 'FirstLogonAnim',
+                        'OneDrive', 'OneDriveSetup', 'WindowsTerminal', 'wt', 'wsl', 'LogonUI'
+            $found = Get-Process -Name $suspects -ErrorAction SilentlyContinue
+            if ($found) {
+              foreach ($p in $found) { $lines += "  $($p.ProcessName) [$($p.Id)] : $($p.MainWindowTitle)" }
+            } else {
+              $lines += '  (none)'
+            }
+
+            $lines | Tee-Object -FilePath (Join-Path $out "windows-$Label.txt")
+            Write-Host ''
+
+            try {
+              Add-Type -AssemblyName System.Windows.Forms
+              Add-Type -AssemblyName System.Drawing
+              $screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+              $bitmap = New-Object System.Drawing.Bitmap $screen.Width, $screen.Height
+              $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+              $graphics.CopyFromScreen($screen.Location, [System.Drawing.Point]::Empty, $screen.Size)
+              $bitmap.Save((Join-Path $out "desktop-$Label.png"), [System.Drawing.Imaging.ImageFormat]::Png)
+              $graphics.Dispose()
+              $bitmap.Dispose()
+              Write-Host "screenshot $Label saved ($($screen.Width)x$($screen.Height))"
+            } catch {
+              Write-Host "screenshot $Label FAILED: $($_.Exception.Message)"
+            }
+          }
+
+          Get-DesktopState -Label 't0'
+          Start-Sleep -Seconds ([int] '${{ inputs.settle_seconds || 60 }}')
+          Get-DesktopState -Label 't1'
+          exit 0
+
+      - name: Registry and session forensics
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $lines = @()
+
+          function Add-Section { param([string] $Name) $script:lines += ''; $script:lines += "=== $Name ===" }
+          function Add-RegValues {
+            param([string] $Path, [string[]] $Names)
+            foreach ($name in $Names) {
+              $value = Get-ItemPropertyValue -Path $Path -Name $name -ErrorAction SilentlyContinue
+              if ($null -eq $value) { $script:lines += "  $name = <absent>" }
+              else { $script:lines += "  $name = $value" }
+            }
+          }
+
+          Add-Section 'image identity'
+          $lines += "  ImageOS       = $env:ImageOS"
+          $lines += "  ImageVersion  = $env:ImageVersion"
+          $lines += "  RUNNER_ARCH   = $env:RUNNER_ARCH"
+          $lines += "  whoami        = $(whoami)"
+          $lines += "  OS caption    = $((Get-CimInstance Win32_OperatingSystem).Caption)"
+
+          Add-Section 'HKLM Windows NT CurrentVersion'
+          Add-RegValues -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -Names 'EditionID', 'DisplayVersion', 'CurrentBuild', 'UBR'
+
+          Add-Section 'sysprep image state (expect IMAGE_STATE_COMPLETE)'
+          Add-RegValues -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State' -Names 'ImageState'
+
+          Add-Section 'PR 14673 target - HKLM Policies OOBE (expect absent before the fix)'
+          Add-RegValues -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\OOBE' -Names 'DisablePrivacyExperience'
+
+          Add-Section 'Win2025 style fix - current user privacy consent'
+          Add-RegValues -Path 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Privacy' -Names 'PrivacyConsentPresentationVersion', 'PrivacyConsentSettingsValidMask', 'PrivacyConsentSettingsVersion'
+
+          Add-Section 'Win2025 style fix - default user profile hive'
+          $loaded = $false
+          try {
+            reg.exe load 'HKLM\REPRO_DEFAULT' 'C:\Users\Default\NTUSER.DAT' 2>&1 | Out-Null
+            $loaded = ($LASTEXITCODE -eq 0)
+          } catch { }
+          if ($loaded) {
+            Add-RegValues -Path 'HKLM:\REPRO_DEFAULT\SOFTWARE\Microsoft\Windows\CurrentVersion\Privacy' -Names 'PrivacyConsentPresentationVersion', 'PrivacyConsentSettingsValidMask', 'PrivacyConsentSettingsVersion'
+            [System.GC]::Collect()
+            reg.exe unload 'HKLM\REPRO_DEFAULT' 2>&1 | Out-Null
+          } else {
+            $lines += '  <could not mount C:\Users\Default\NTUSER.DAT>'
+          }
+
+          Add-Section 'SCOOBE - lets finish setting up'
+          Add-RegValues -Path 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\UserProfileEngagement' -Names 'ScoobeSystemSettingEnabled'
+
+          Add-Section 'terminal sessions'
+          $lines += (cmd.exe /c 'qwinsta' 2>&1 | Out-String).TrimEnd()
+
+          $lines | Tee-Object -FilePath (Join-Path $env:OUT_DIR 'forensics.txt')
+          exit 0
+
+      - name: Verdict
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $suspects = 'WWAHost', 'CloudExperienceHostBroker', 'SystemSettings', 'FirstLogonAnim', 'OneDrive', 'OneDriveSetup', 'WindowsTerminal', 'wt', 'wsl'
+          $found = @(Get-Process -Name $suspects -ErrorAction SilentlyContinue | Select-Object -ExpandProperty ProcessName -Unique)
+          $policy = Get-ItemPropertyValue -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\OOBE' -Name DisablePrivacyExperience -ErrorAction SilentlyContinue
+
+          $verdict = if ($found.Count -gt 0) { 'SUSPECT UI PRESENT' } else { 'no suspect UI process' }
+
+          $report = @(
+            "## ${{ matrix.runner }} / attempt ${{ matrix.attempt }}",
+            '',
+            "| field | value |",
+            "| --- | --- |",
+            "| image version | $env:ImageVersion |",
+            "| DisablePrivacyExperience | $(if ($null -eq $policy) { 'absent' } else { $policy }) |",
+            "| suspect processes | $(if ($found.Count -gt 0) { $found -join ', ' } else { 'none' }) |",
+            "| verdict | **$verdict** |",
+            '',
+            'Screenshots are in the job artifact. Confirm visually before concluding.'
+          )
+          $report | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          $report | Write-Host
+          exit 0
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: repro-14069-${{ matrix.runner }}-attempt${{ matrix.attempt }}
+          path: ${{ env.OUT_DIR }}
+          if-no-files-found: warn
