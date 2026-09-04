@@ -161,6 +161,58 @@ jobs:
           $lines | Tee-Object -FilePath (Join-Path $env:OUT_DIR 'forensics.txt')
           exit 0
 
+      - name: Privacy posture and ACLs
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $lines = @()
+
+          function Add-Section { param([string] $Name) $script:lines += ''; $script:lines += "=== $Name ===" }
+          function Add-Reg {
+            param([string] $Path, [string] $Name)
+            $value = Get-ItemPropertyValue -Path $Path -Name $Name -ErrorAction SilentlyContinue
+            if ($null -eq $value) { $script:lines += "  ${Path} :: ${Name} = <absent>" }
+            else { $script:lines += "  ${Path} :: ${Name} = $value" }
+          }
+
+          Add-Section 'effective telemetry (machine policy beats any per-user consent)'
+          Add-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection' 'AllowTelemetry'
+          Add-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection' 'AllowTelemetry'
+          Add-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\SQMClient\Windows' 'CEIPEnable'
+          $svc = Get-Service -Name DiagTrack -ErrorAction SilentlyContinue
+          if ($svc) { $lines += "  DiagTrack service: Status=$($svc.Status) StartType=$($svc.StartType)" }
+          else { $lines += '  DiagTrack service: <absent>' }
+
+          Add-Section 'per-feature privacy toggles the OOBE page would have set'
+          Add-Reg 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\AdvertisingInfo' 'Enabled'
+          Add-Reg 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location' 'Value'
+          Add-Reg 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Privacy' 'TailoredExperiencesWithDiagnosticDataEnabled'
+          Add-Reg 'HKCU:\SOFTWARE\Microsoft\InputPersonalization' 'RestrictImplicitTextCollection'
+          Add-Reg 'HKCU:\SOFTWARE\Microsoft\InputPersonalization' 'RestrictImplicitInkCollection'
+          Add-Reg 'HKCU:\SOFTWARE\Microsoft\Personalization\Settings' 'AcceptedPrivacyPolicy'
+          Add-Reg 'HKCU:\SOFTWARE\Microsoft\Siuf\Rules' 'NumberOfSIUFInPeriod'
+
+          Add-Section 'who can write the two fix locations'
+          $lines += "  job user: $(whoami)"
+          $lines += "  is admin: $([bool](whoami /groups | Select-String -SimpleMatch 'S-1-5-32-544'))"
+          foreach ($target in 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\OOBE', 'HKLM:\SOFTWARE\Policies\Microsoft\Windows') {
+            $acl = Get-Acl -Path $target -ErrorAction SilentlyContinue
+            if ($acl) {
+              $lines += "  ACL $target"
+              foreach ($ace in $acl.Access) { $lines += "    $($ace.IdentityReference) : $($ace.RegistryRights) : $($ace.AccessControlType)" }
+              break
+            }
+          }
+          $fileAcl = Get-Acl -Path 'C:\Users\Default\NTUSER.DAT' -ErrorAction SilentlyContinue
+          if ($fileAcl) {
+            $lines += '  ACL C:\Users\Default\NTUSER.DAT'
+            foreach ($ace in $fileAcl.Access) { $lines += "    $($ace.IdentityReference) : $($ace.FileSystemRights) : $($ace.AccessControlType)" }
+          }
+
+          $lines | Tee-Object -FilePath (Join-Path $env:OUT_DIR 'privacy-posture.txt')
+          exit 0
+
       - name: Verdict
         if: always()
         shell: pwsh
