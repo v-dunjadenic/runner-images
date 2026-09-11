@@ -191,13 +191,16 @@ jobs:
           foreach ($v in @('10.1.2493.9590', '11.7.157.1')) {
             $exe = "$env:RUNNER_TEMP\sf-$v.exe"
             Write-Host "Downloading $v ..."
-            Invoke-WebRequest -Uri "$base/MicrosoftServiceFabric.$v.exe" -OutFile $exe -UseBasicParsing
-            $listing = & $sevenZip l -ba $exe 2>$null
+            curl.exe -sSL -o $exe "$base/MicrosoftServiceFabric.$v.exe"
+            Write-Host "size: $((Get-Item $exe).Length)"
+            $listing = & $sevenZip l -ba -r $exe 2>&1
+            Write-Host "7z exit=$LASTEXITCODE lines=$($listing.Count)"
+            $listing | Select-Object -First 15 | ForEach-Object { Write-Host "  RAW: $_" }
             $dlls = $listing | ForEach-Object {
-              if ($_ -match '\s(\S+\.dll)\s*$') { Split-Path -Leaf $matches[1] }
+              if ("$_" -match '([^\s\\/]+\.dll)\s*$') { $matches[1] }
             } | Sort-Object -Unique
-            $result[$v] = $dlls
-            Write-Host "$v : $($dlls.Count) dll entries"
+            $result[$v] = @($dlls)
+            Write-Host "$v : $($result[$v].Count) dll entries"
             Remove-Item $exe -Force
           }
           foreach ($n in @('re2.dll','abseil_dll.dll','zlib1.dll','cares.dll','msvcp140.dll','vcruntime140.dll')) {
@@ -205,9 +208,8 @@ jobs:
             $new = if ($result['11.7.157.1'] -contains $n) { 'PRESENT' } else { 'absent' }
             Write-Host ("{0,-20} 10.1={1,-8} 11.7={2}" -f $n, $old, $new)
           }
-          Write-Host '--- DLLs added in 11.7 ---'
-          Compare-Object $result['10.1.2493.9590'] $result['11.7.157.1'] |
-            Where-Object { $_.SideIndicator -eq '=>' } | ForEach-Object { Write-Host "  + $($_.InputObject)" }
-          Write-Host '--- DLLs removed in 11.7 ---'
-          Compare-Object $result['10.1.2493.9590'] $result['11.7.157.1'] |
-            Where-Object { $_.SideIndicator -eq '<=' } | ForEach-Object { Write-Host "  - $($_.InputObject)" }
+          if ($result['10.1.2493.9590'].Count -and $result['11.7.157.1'].Count) {
+            Write-Host '--- DLLs added in 11.7 ---'
+            Compare-Object $result['10.1.2493.9590'] $result['11.7.157.1'] |
+              Where-Object { $_.SideIndicator -eq '=>' } | ForEach-Object { Write-Host "  + $($_.InputObject)" }
+          }
