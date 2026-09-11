@@ -39,20 +39,16 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Continue'
-          $keys = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
-                  'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
-          $entries = Get-ItemProperty $keys -ErrorAction SilentlyContinue |
-            Where-Object { $_.DisplayName -like '*Service Fabric*' }
-          $entries | ForEach-Object { Write-Host "FOUND: $($_.DisplayName) | $($_.UninstallString)" }
-          foreach ($e in $entries | Where-Object { $_.DisplayName -notlike '*SDK*' }) {
-            if ($e.UninstallString -match '(?i)msiexec') {
-              $code = ($e.UninstallString -replace '(?i).*({[0-9A-F-]+}).*', '$1')
-              Write-Host "msiexec /x $code"
-              Start-Process msiexec.exe -ArgumentList "/x", $code, "/quiet", "/norestart" -Wait -PassThru |
-                ForEach-Object { Write-Host "  exit=$($_.ExitCode)" }
-            }
+          $clean = "$env:FABRIC_CODE\CleanFabric.ps1"
+          Write-Host "CleanFabric.ps1 present: $(Test-Path -LiteralPath $clean)"
+          if (Test-Path -LiteralPath $clean) {
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $clean 2>&1 |
+              Select-Object -Last 20 | ForEach-Object { Write-Host "  $_" }
+            Write-Host "powershell exit: $LASTEXITCODE"
           }
           Write-Host "Fabric.Code still present: $(Test-Path -LiteralPath $env:FABRIC_CODE)"
+          $ver = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Service Fabric\' -Name FabricVersion -ErrorAction SilentlyContinue
+          Write-Host "FabricVersion after clean: $($ver.FabricVersion)"
 
       - name: Install Service Fabric 10.1 and capture re2
         shell: pwsh
