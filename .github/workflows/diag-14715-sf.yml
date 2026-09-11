@@ -1,0 +1,92 @@
+name: Diag 14715 - Service Fabric re2 comparison
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - diag-14715
+
+jobs:
+  sf-downgrade-compare:
+    name: Compare Fabric.Code payload 11.7 vs 10.1
+    runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      FABRIC_CODE: C:\Program Files\Microsoft Service Fabric\bin\Fabric\Fabric.Code
+      SF_BASE: https://download.microsoft.com/download/b/8/a/b8a2fb98-0ec1-41e5-be98-9d8b5abf7856
+    steps:
+      - name: Snapshot Service Fabric 11.7 (image default)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Get-ItemPropertyValue 'HKLM:\SOFTWARE\Microsoft\Service Fabric\' -Name FabricVersion | Write-Host
+          Get-ChildItem -LiteralPath $env:FABRIC_CODE -Filter *.dll -File |
+            Select-Object -ExpandProperty Name | Sort-Object |
+            Set-Content "$env:RUNNER_TEMP\dlls-11.7.txt"
+          Write-Host "dll count 11.7: $((Get-Content "$env:RUNNER_TEMP\dlls-11.7.txt").Count)"
+          Copy-Item "$env:FABRIC_CODE\re2.dll" "$env:RUNNER_TEMP\re2-11.7.dll" -ErrorAction SilentlyContinue
+
+      - name: Dump re2.dll exports (11.7)
+        shell: cmd
+        run: |
+          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          if exist "%RUNNER_TEMP%\re2-11.7.dll" dumpbin /exports "%RUNNER_TEMP%\re2-11.7.dll" > "%RUNNER_TEMP%\exports-11.7.txt"
+          exit /b 0
+
+      - name: Install Service Fabric runtime 10.1.2493.9590
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = "$env:RUNNER_TEMP\sf-10.1.exe"
+          curl.exe -sSL --fail -o $exe "$env:SF_BASE/MicrosoftServiceFabric.10.1.2493.9590.exe"
+          Write-Host "size: $((Get-Item $exe).Length)"
+          $p = Start-Process -FilePath $exe -ArgumentList '/accepteula', '/quiet', '/force' -Wait -PassThru
+          Write-Host "installer exit: $($p.ExitCode)"
+
+      - name: Snapshot Service Fabric 10.1
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Get-ItemPropertyValue 'HKLM:\SOFTWARE\Microsoft\Service Fabric\' -Name FabricVersion | Write-Host
+          Get-ChildItem -LiteralPath $env:FABRIC_CODE -Filter *.dll -File |
+            Select-Object -ExpandProperty Name | Sort-Object |
+            Set-Content "$env:RUNNER_TEMP\dlls-10.1.txt"
+          Write-Host "dll count 10.1: $((Get-Content "$env:RUNNER_TEMP\dlls-10.1.txt").Count)"
+          Copy-Item "$env:FABRIC_CODE\re2.dll" "$env:RUNNER_TEMP\re2-10.1.dll" -ErrorAction SilentlyContinue
+
+      - name: Dump re2.dll exports (10.1)
+        shell: cmd
+        run: |
+          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          if exist "%RUNNER_TEMP%\re2-10.1.dll" dumpbin /exports "%RUNNER_TEMP%\re2-10.1.dll" > "%RUNNER_TEMP%\exports-10.1.txt"
+          exit /b 0
+
+      - name: Verdict
+        shell: pwsh
+        run: |
+          $old = @(Get-Content "$env:RUNNER_TEMP\dlls-10.1.txt" -ErrorAction SilentlyContinue)
+          $new = @(Get-Content "$env:RUNNER_TEMP\dlls-11.7.txt" -ErrorAction SilentlyContinue)
+          Write-Host "re2.dll in 10.1: $($old -contains 're2.dll')  in 11.7: $($new -contains 're2.dll')"
+          foreach ($n in @('re2.dll','abseil_dll.dll','zlib1.dll','cares.dll')) {
+            Write-Host ("{0,-18} 10.1={1,-7} 11.7={2}" -f $n, ($old -contains $n), ($new -contains $n))
+          }
+          Write-Host '--- DLLs added in 11.7 ---'
+          Compare-Object $old $new | Where-Object { $_.SideIndicator -eq '=>' } |
+            ForEach-Object { Write-Host "  + $($_.InputObject)" }
+
+          function Get-ExportNames($p) {
+            $s = New-Object System.Collections.Generic.HashSet[string]
+            foreach ($l in (Get-Content $p -ErrorAction SilentlyContinue)) {
+              if ($l -match '^\s+\d+\s+[0-9A-F]+\s+[0-9A-F]{8}\s+(\S+)') { [void]$s.Add($matches[1]) }
+            }
+            return $s
+          }
+          $eOld = Get-ExportNames "$env:RUNNER_TEMP\exports-10.1.txt"
+          $eNew = Get-ExportNames "$env:RUNNER_TEMP\exports-11.7.txt"
+          Write-Host "re2.dll export count  10.1=$($eOld.Count)  11.7=$($eNew.Count)"
+          $common = [System.Linq.Enumerable]::Count([System.Linq.Enumerable]::Where($eOld, [Func[string, bool]] { param($x) $eNew.Contains($x) }))
+          Write-Host "exports present in BOTH: $common"
+          Write-Host '--- sample exports 10.1 ---'
+          $eOld | Select-Object -First 8 | ForEach-Object { Write-Host "   $_" }
+          Write-Host '--- sample exports 11.7 ---'
+          $eNew | Select-Object -First 8 | ForEach-Object { Write-Host "   $_" }
