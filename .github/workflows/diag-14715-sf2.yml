@@ -1,0 +1,101 @@
+name: Diag 14715 - Service Fabric 10.1 re2 capture
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - diag-14715
+
+jobs:
+  capture-old-re2:
+    name: Uninstall SF 11.7 then install SF 10.1
+    runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      FABRIC_CODE: C:\Program Files\Microsoft Service Fabric\bin\Fabric\Fabric.Code
+      SF_BASE: https://download.microsoft.com/download/b/8/a/b8a2fb98-0ec1-41e5-be98-9d8b5abf7856
+    steps:
+      - name: Baseline 11.7 re2 exports
+        shell: cmd
+        run: |
+          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          dumpbin /exports "%FABRIC_CODE%\re2.dll" > "%RUNNER_TEMP%\exports-11.7.txt"
+          dumpbin /headers "%FABRIC_CODE%\re2.dll" | findstr /C:"time date stamp" /C:"linker version"
+          exit /b 0
+
+      - name: Installer help text
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $exe = "$env:RUNNER_TEMP\sf-10.1.exe"
+          curl.exe -sSL --fail -o $exe "$env:SF_BASE/MicrosoftServiceFabric.10.1.2493.9590.exe"
+          $p = Start-Process -FilePath $exe -ArgumentList '/?' -Wait -PassThru `
+            -RedirectStandardOutput "$env:RUNNER_TEMP\help.txt" -RedirectStandardError "$env:RUNNER_TEMP\helperr.txt"
+          Write-Host "exit=$($p.ExitCode)"
+          Get-Content "$env:RUNNER_TEMP\help.txt", "$env:RUNNER_TEMP\helperr.txt" -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-Host "  $_" }
+
+      - name: Uninstall existing Service Fabric runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $keys = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                  'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+          $entries = Get-ItemProperty $keys -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -like '*Service Fabric*' }
+          $entries | ForEach-Object { Write-Host "FOUND: $($_.DisplayName) | $($_.UninstallString)" }
+          foreach ($e in $entries | Where-Object { $_.DisplayName -notlike '*SDK*' }) {
+            if ($e.UninstallString -match '(?i)msiexec') {
+              $code = ($e.UninstallString -replace '(?i).*({[0-9A-F-]+}).*', '$1')
+              Write-Host "msiexec /x $code"
+              Start-Process msiexec.exe -ArgumentList "/x", $code, "/quiet", "/norestart" -Wait -PassThru |
+                ForEach-Object { Write-Host "  exit=$($_.ExitCode)" }
+            }
+          }
+          Write-Host "Fabric.Code still present: $(Test-Path -LiteralPath $env:FABRIC_CODE)"
+
+      - name: Install Service Fabric 10.1 and capture re2
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $exe = "$env:RUNNER_TEMP\sf-10.1.exe"
+          $p = Start-Process -FilePath $exe -ArgumentList '/accepteula', '/quiet', '/force' -Wait -PassThru
+          Write-Host "installer exit: $($p.ExitCode)"
+          $ver = Get-ItemPropertyValue 'HKLM:\SOFTWARE\Microsoft\Service Fabric\' -Name FabricVersion -ErrorAction SilentlyContinue
+          Write-Host "FabricVersion now: $ver"
+          if (Test-Path -LiteralPath $env:FABRIC_CODE) {
+            $dlls = Get-ChildItem -LiteralPath $env:FABRIC_CODE -Filter *.dll -File
+            Write-Host "dll count: $($dlls.Count)"
+            foreach ($n in @('re2.dll','abseil_dll.dll','zlib1.dll','cares.dll')) {
+              Write-Host ("  {0,-18} {1}" -f $n, ($dlls.Name -contains $n))
+            }
+          }
+
+      - name: Compare re2 exports
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $old = "$env:FABRIC_CODE\re2.dll"
+          if (Test-Path -LiteralPath $old) {
+            cmd /c "call `"%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat`" >nul && dumpbin /exports `"$old`" > `"$env:RUNNER_TEMP\exports-10.1.txt`""
+          }
+          function Get-ExportNames($p) {
+            $s = New-Object System.Collections.Generic.HashSet[string]
+            foreach ($l in (Get-Content $p -ErrorAction SilentlyContinue)) {
+              if ($l -match '^\s+\d+\s+[0-9A-F]+\s+[0-9A-F]{8}\s+(\S+)') { [void]$s.Add($matches[1]) }
+            }
+            return $s
+          }
+          $eOld = Get-ExportNames "$env:RUNNER_TEMP\exports-10.1.txt"
+          $eNew = Get-ExportNames "$env:RUNNER_TEMP\exports-11.7.txt"
+          Write-Host "re2.dll exports  10.1=$($eOld.Count)  11.7=$($eNew.Count)"
+          $common = 0
+          foreach ($e in $eOld) { if ($eNew.Contains($e)) { $common++ } }
+          Write-Host "exports in BOTH: $common"
+          Write-Host '--- StringPiece vs string_view signal ---'
+          $oldSp = @($eOld | Where-Object { $_ -match 'StringPiece' }).Count
+          $newSp = @($eNew | Where-Object { $_ -match 'StringPiece' }).Count
+          $oldSv = @($eOld | Where-Object { $_ -match 'string_view' }).Count
+          $newSv = @($eNew | Where-Object { $_ -match 'string_view' }).Count
+          Write-Host "10.1: StringPiece=$oldSp string_view=$oldSv"
+          Write-Host "11.7: StringPiece=$newSp string_view=$newSv"
