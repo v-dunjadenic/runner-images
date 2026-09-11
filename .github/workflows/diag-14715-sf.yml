@@ -33,26 +33,50 @@ jobs:
           if exist "%RUNNER_TEMP%\re2-11.7.dll" dumpbin /exports "%RUNNER_TEMP%\re2-11.7.dll" > "%RUNNER_TEMP%\exports-11.7.txt"
           exit /b 0
 
-      - name: Install Service Fabric runtime 10.1.2493.9590
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $exe = "$env:RUNNER_TEMP\sf-10.1.exe"
-          curl.exe -sSL --fail -o $exe "$env:SF_BASE/MicrosoftServiceFabric.10.1.2493.9590.exe"
-          Write-Host "size: $((Get-Item $exe).Length)"
-          $p = Start-Process -FilePath $exe -ArgumentList '/accepteula', '/quiet', '/force' -Wait -PassThru
-          Write-Host "installer exit: $($p.ExitCode)"
-
-      - name: Snapshot Service Fabric 10.1
+      - name: Extract Service Fabric runtime 10.1.2493.9590
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Continue'
-          Get-ItemPropertyValue 'HKLM:\SOFTWARE\Microsoft\Service Fabric\' -Name FabricVersion | Write-Host
-          Get-ChildItem -LiteralPath $env:FABRIC_CODE -Filter *.dll -File |
-            Select-Object -ExpandProperty Name | Sort-Object |
-            Set-Content "$env:RUNNER_TEMP\dlls-10.1.txt"
-          Write-Host "dll count 10.1: $((Get-Content "$env:RUNNER_TEMP\dlls-10.1.txt").Count)"
-          Copy-Item "$env:FABRIC_CODE\re2.dll" "$env:RUNNER_TEMP\re2-10.1.dll" -ErrorAction SilentlyContinue
+          $exe = "$env:RUNNER_TEMP\sf-10.1.exe"
+          curl.exe -sSL --fail -o $exe "$env:SF_BASE/MicrosoftServiceFabric.10.1.2493.9590.exe"
+          Write-Host "size: $((Get-Item $exe).Length)"
+          $out = "$env:RUNNER_TEMP\sf10"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+
+          Write-Host '--- attempt: self-extract /E: ---'
+          $p = Start-Process -FilePath $exe -ArgumentList "/E:`"$out`"" -Wait -PassThru -ErrorAction SilentlyContinue
+          Write-Host "exit=$($p.ExitCode) files=$((Get-ChildItem $out -Recurse -File -ErrorAction SilentlyContinue).Count)"
+
+          if ((Get-ChildItem $out -Recurse -File -ErrorAction SilentlyContinue).Count -eq 0) {
+            Write-Host '--- attempt: WiX dark.exe ---'
+            & 'C:\Program Files (x86)\WiX Toolset v3.14\bin\dark.exe' -nologo -x $out $exe 2>&1 | Select-Object -First 10 | ForEach-Object { Write-Host "  $_" }
+            Write-Host "files=$((Get-ChildItem $out -Recurse -File -ErrorAction SilentlyContinue).Count)"
+          }
+          if ((Get-ChildItem $out -Recurse -File -ErrorAction SilentlyContinue).Count -eq 0) {
+            Write-Host '--- attempt: 7z x ---'
+            & 'C:\Program Files\7-Zip\7z.exe' x -y -o"$out" $exe 2>&1 | Select-Object -Last 6 | ForEach-Object { Write-Host "  $_" }
+            Write-Host "files=$((Get-ChildItem $out -Recurse -File -ErrorAction SilentlyContinue).Count)"
+          }
+
+          Get-ChildItem $out -Recurse -File -ErrorAction SilentlyContinue |
+            Select-Object -First 30 | ForEach-Object { Write-Host "  OUT: $($_.FullName.Replace($out,''))  $($_.Length)" }
+
+          $cab = Get-ChildItem $out -Recurse -File -Include *.cab, *.msi -ErrorAction SilentlyContinue
+          foreach ($c in $cab) {
+            Write-Host "--- expanding $($c.Name) ---"
+            $sub = Join-Path $out ("x_" + $c.BaseName)
+            New-Item -ItemType Directory -Force -Path $sub | Out-Null
+            & 'C:\Program Files\7-Zip\7z.exe' x -y -o"$sub" $c.FullName > $null 2>&1
+            $dlls = Get-ChildItem $sub -Recurse -File -Filter *.dll -ErrorAction SilentlyContinue
+            Write-Host "  dlls: $($dlls.Count)"
+            foreach ($n in @('re2.dll','abseil_dll.dll','zlib1.dll','cares.dll')) {
+              $hit = $dlls | Where-Object { $_.Name -eq $n } | Select-Object -First 1
+              Write-Host ("  {0,-18} {1}" -f $n, $(if ($hit) { $hit.FullName } else { 'absent' }))
+            }
+            $r = $dlls | Where-Object { $_.Name -eq 're2.dll' } | Select-Object -First 1
+            if ($r) { Copy-Item $r.FullName "$env:RUNNER_TEMP\re2-10.1.dll" -Force }
+          }
+          if (Test-Path "$env:RUNNER_TEMP\re2-10.1.dll") { Write-Host 'CAPTURED re2-10.1.dll' } else { Write-Host 're2-10.1.dll NOT captured' }
 
       - name: Dump re2.dll exports (10.1)
         shell: cmd
@@ -64,16 +88,6 @@ jobs:
       - name: Verdict
         shell: pwsh
         run: |
-          $old = @(Get-Content "$env:RUNNER_TEMP\dlls-10.1.txt" -ErrorAction SilentlyContinue)
-          $new = @(Get-Content "$env:RUNNER_TEMP\dlls-11.7.txt" -ErrorAction SilentlyContinue)
-          Write-Host "re2.dll in 10.1: $($old -contains 're2.dll')  in 11.7: $($new -contains 're2.dll')"
-          foreach ($n in @('re2.dll','abseil_dll.dll','zlib1.dll','cares.dll')) {
-            Write-Host ("{0,-18} 10.1={1,-7} 11.7={2}" -f $n, ($old -contains $n), ($new -contains $n))
-          }
-          Write-Host '--- DLLs added in 11.7 ---'
-          Compare-Object $old $new | Where-Object { $_.SideIndicator -eq '=>' } |
-            ForEach-Object { Write-Host "  + $($_.InputObject)" }
-
           function Get-ExportNames($p) {
             $s = New-Object System.Collections.Generic.HashSet[string]
             foreach ($l in (Get-Content $p -ErrorAction SilentlyContinue)) {
@@ -84,7 +98,8 @@ jobs:
           $eOld = Get-ExportNames "$env:RUNNER_TEMP\exports-10.1.txt"
           $eNew = Get-ExportNames "$env:RUNNER_TEMP\exports-11.7.txt"
           Write-Host "re2.dll export count  10.1=$($eOld.Count)  11.7=$($eNew.Count)"
-          $common = [System.Linq.Enumerable]::Count([System.Linq.Enumerable]::Where($eOld, [Func[string, bool]] { param($x) $eNew.Contains($x) }))
+          $common = 0
+          foreach ($e in $eOld) { if ($eNew.Contains($e)) { $common++ } }
           Write-Host "exports present in BOTH: $common"
           Write-Host '--- sample exports 10.1 ---'
           $eOld | Select-Object -First 8 | ForEach-Object { Write-Host "   $_" }
