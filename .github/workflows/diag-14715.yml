@@ -1,0 +1,177 @@
+name: Diag 14715 - win22 STATUS_ENTRYPOINT_NOT_FOUND
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - diag-14715
+
+jobs:
+  env-probe:
+    name: Probe image environment
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - name: Image identity
+        shell: pwsh
+        run: |
+          Get-Content "$env:ProgramData\actions-runner-imagegeneration\imagedata.json" -ErrorAction SilentlyContinue
+          Write-Host "ImageVersion=$env:ImageVersion"
+          [System.Environment]::OSVersion.Version
+
+      - name: Machine PATH
+        shell: pwsh
+        run: |
+          $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine') -split ';' | Where-Object { $_ }
+          Write-Host "--- Machine PATH ($($machine.Count) entries) ---"
+          $machine | ForEach-Object { Write-Host $_ }
+          Write-Host "--- Process PATH ---"
+          ($env:PATH -split ';' | Where-Object { $_ }) | ForEach-Object { Write-Host $_ }
+
+      - name: DLL inventory of every PATH directory
+        shell: pwsh
+        run: |
+          $dirs = ($env:PATH -split ';' | Where-Object { $_ }) | Select-Object -Unique
+          $rows = foreach ($d in $dirs) {
+            if (-not (Test-Path -LiteralPath $d)) { continue }
+            Get-ChildItem -LiteralPath $d -Filter *.dll -File -ErrorAction SilentlyContinue |
+              ForEach-Object { [pscustomobject]@{ Dir = $d; Dll = $_.Name; Version = $_.VersionInfo.FileVersion } }
+          }
+          $rows | Sort-Object Dll | Format-Table -AutoSize | Out-String -Width 400 | Write-Host
+          Write-Host "--- DLL names that appear in MORE THAN ONE PATH directory ---"
+          $rows | Group-Object Dll | Where-Object { $_.Count -gt 1 } |
+            ForEach-Object { Write-Host "$($_.Name): $($_.Group.Dir -join ' | ')" }
+          Write-Host "--- Candidate collisions for a gRPC/protobuf/abseil/re2 C++ build ---"
+          $candidates = 're2.dll','zlib1.dll','zlib.dll','libprotobuf.dll','abseil_dll.dll','libcrypto-3-x64.dll','libssl-3-x64.dll','ssl.dll','crypto.dll','cares.dll','libcares.dll','msvcp140.dll','vcruntime140.dll','vcruntime140_1.dll','msvcp140_1.dll','msvcp140_2.dll','msvcp140_atomic_wait.dll','msvcp140_codecvt_ids.dll','concrt140.dll','ucrtbase.dll'
+          $rows | Where-Object { $candidates -contains $_.Dll.ToLower() } | Format-Table -AutoSize | Out-String -Width 400 | Write-Host
+
+      - name: Service Fabric footprint
+        shell: pwsh
+        run: |
+          foreach ($root in @('C:\Program Files\Microsoft Service Fabric', 'C:\Program Files\Microsoft SDKs\Service Fabric')) {
+            Write-Host "=== $root ==="
+            if (-not (Test-Path -LiteralPath $root)) { Write-Host '(absent)'; continue }
+            $dlls = Get-ChildItem -LiteralPath $root -Filter *.dll -File -Recurse -ErrorAction SilentlyContinue
+            Write-Host "dll count: $($dlls.Count)"
+            $dlls | Group-Object DirectoryName | Sort-Object Count -Descending | Select-Object -First 10 |
+              ForEach-Object { Write-Host "  $($_.Count)  $($_.Name)" }
+          }
+          Write-Host "=== Service Fabric dirs present on PATH ==="
+          ($env:PATH -split ';') | Where-Object { $_ -like '*Service Fabric*' } | ForEach-Object { Write-Host $_ }
+          Write-Host "=== Registry versions ==="
+          Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Service Fabric\' -ErrorAction SilentlyContinue | Select-Object FabricVersion, FabricRoot, FabricCodePath | Format-List
+          Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Service Fabric SDK\' -ErrorAction SilentlyContinue | Select-Object FabricSDKVersion, FabricSDKInstallPath | Format-List
+
+      - name: System32 CRT versions
+        shell: pwsh
+        run: |
+          Get-ChildItem C:\Windows\System32 -Filter 'msvcp140*.dll' -File |
+            ForEach-Object { "{0,-34} {1}" -f $_.Name, $_.VersionInfo.FileVersion } | Write-Host
+          Get-ChildItem C:\Windows\System32 -Filter 'vcruntime140*.dll' -File |
+            ForEach-Object { "{0,-34} {1}" -f $_.Name, $_.VersionInfo.FileVersion } | Write-Host
+          Get-ChildItem C:\Windows\System32 -Filter 'ucrtbase*.dll' -File |
+            ForEach-Object { "{0,-34} {1}" -f $_.Name, $_.VersionInfo.FileVersion } | Write-Host
+
+  repro:
+    name: Repro and resolve the missing entry point
+    runs-on: windows-2022
+    timeout-minutes: 300
+    steps:
+      - name: Checkout milvus-sdk-cpp
+        uses: actions/checkout@v5
+        with:
+          repository: milvus-io/milvus-sdk-cpp
+          ref: master
+          path: sdk
+
+      - name: Install build tools
+        shell: cmd
+        run: choco install cmake ninja --no-progress
+
+      - name: Build testing-ut
+        shell: cmd
+        working-directory: sdk
+        run: |
+          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          cmake -S . -B build -DMILVUS_BUILD_TEST=YES -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DMILVUS_ENABLE_UNITY=ON -G Ninja
+          cmake --build build --target testing-ut
+
+      - name: Reproduce the failure
+        id: run
+        shell: cmd
+        working-directory: sdk
+        run: |
+          set PATH=%CD%\build\src;%PATH%
+          build\test\testing-ut
+          echo exit code was %errorlevel%
+          exit /b 0
+
+      - name: Resolve every import against the DLL the loader would pick
+        shell: pwsh
+        working-directory: sdk
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:PATH = "$PWD\build\src;$env:PATH"
+          $vcvars = "$env:ProgramFiles\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          $dumpbin = (cmd /c "`"$vcvars`" >nul 2>&1 && where dumpbin") -split "`r?`n" | Select-Object -First 1
+
+          function Invoke-Dumpbin($switch, $file) {
+            cmd /c "`"$vcvars`" >nul 2>&1 && `"$dumpbin`" $switch `"$file`"" 2>$null
+          }
+
+          # Same order the loader uses for an implicitly linked dependency.
+          function Resolve-Loader($name, $appDir) {
+            $probe = @($appDir, "$env:SystemRoot\System32", "$env:SystemRoot\System", $env:SystemRoot, $PWD.Path) +
+                     (($env:PATH -split ';') | Where-Object { $_ })
+            foreach ($d in $probe) {
+              $p = Join-Path $d $name
+              if (Test-Path -LiteralPath $p) { return $p }
+            }
+            return $null
+          }
+
+          function Get-Imports($file) {
+            $lines = Invoke-Dumpbin '/imports' $file
+            $map = @{}; $current = $null
+            foreach ($l in $lines) {
+              if ($l -match '^\s{4}(\S+\.dll)\s*$') { $current = $matches[1]; $map[$current] = @(); continue }
+              if ($current -and $l -match '^\s+[0-9A-F]{8}\s+[0-9A-F]+\s+(\S.*)$') { $map[$current] += $matches[1].Trim() }
+            }
+            return $map
+          }
+
+          function Get-Exports($file) {
+            $set = New-Object System.Collections.Generic.HashSet[string]
+            foreach ($l in (Invoke-Dumpbin '/exports' $file)) {
+              if ($l -match '^\s+\d+\s+[0-9A-F]+\s+[0-9A-F]{8}\s+(\S+)') { [void]$set.Add($matches[1]) }
+            }
+            return $set
+          }
+
+          $exe = "$PWD\build\test\testing-ut.exe"
+          $appDir = Split-Path -Parent $exe
+          $queue = [System.Collections.Queue]::new(); $queue.Enqueue($exe)
+          $seen = @{}; $problems = @()
+
+          while ($queue.Count -gt 0) {
+            $mod = $queue.Dequeue()
+            if ($seen.ContainsKey($mod.ToLower())) { continue }
+            $seen[$mod.ToLower()] = $true
+            Write-Host "== $mod"
+            foreach ($entry in (Get-Imports $mod).GetEnumerator()) {
+              $resolved = Resolve-Loader $entry.Key $appDir
+              if (-not $resolved) { Write-Host "   MISSING MODULE: $($entry.Key)"; $problems += "MODULE $($entry.Key)"; continue }
+              Write-Host "   $($entry.Key) -> $resolved"
+              $exports = Get-Exports $resolved
+              $missing = $entry.Value | Where-Object { -not $exports.Contains($_) }
+              if ($missing) {
+                Write-Host "   *** ENTRY POINTS MISSING IN $resolved ***"
+                $missing | ForEach-Object { Write-Host "       $_" }
+                $problems += "ENTRYPOINT $($entry.Key): $($missing -join ', ')"
+              }
+              if ($resolved -notlike "$env:SystemRoot*") { $queue.Enqueue($resolved) }
+            }
+          }
+
+          Write-Host "===================== VERDICT ====================="
+          if ($problems) { $problems | ForEach-Object { Write-Host $_ } } else { Write-Host 'No unresolved imports found' }
