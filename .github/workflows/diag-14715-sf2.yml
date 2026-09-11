@@ -50,15 +50,36 @@ jobs:
           $ver = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Service Fabric\' -Name FabricVersion -ErrorAction SilentlyContinue
           Write-Host "FabricVersion after clean: $($ver.FabricVersion)"
 
+      - name: Remove Service Fabric SDK too
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $sdk = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -like '*Service Fabric*SDK*' }
+          foreach ($e in $sdk) {
+            $code = ($e.UninstallString -replace '(?i).*({[0-9A-F-]+}).*', '$1')
+            Write-Host "removing $($e.DisplayName) -> $code"
+            (Start-Process msiexec.exe -ArgumentList '/x', $code, '/quiet', '/norestart' -Wait -PassThru).ExitCode | Write-Host
+          }
+
       - name: Install Service Fabric 10.1 and capture re2
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Continue'
           $exe = "$env:RUNNER_TEMP\sf-10.1.exe"
-          $p = Start-Process -FilePath $exe -ArgumentList '/accepteula', '/quiet', '/force' -Wait -PassThru
+          $before = Get-Date
+          $p = Start-Process -FilePath $exe -ArgumentList '/accepteula', '/quiet' -Wait -PassThru
           Write-Host "installer exit: $($p.ExitCode)"
-          $ver = Get-ItemPropertyValue 'HKLM:\SOFTWARE\Microsoft\Service Fabric\' -Name FabricVersion -ErrorAction SilentlyContinue
-          Write-Host "FabricVersion now: $ver"
+          Write-Host '--- installer logs ---'
+          foreach ($dir in @($env:TEMP, 'C:\Windows\Temp', 'C:\ProgramData\SF')) {
+            Get-ChildItem $dir -Recurse -File -Include *.log, *.txt -ErrorAction SilentlyContinue |
+              Where-Object { $_.LastWriteTime -gt $before } | Select-Object -First 5 | ForEach-Object {
+                Write-Host "=== $($_.FullName) ==="
+                Get-Content $_.FullName -Tail 25 | ForEach-Object { Write-Host "   $_" }
+              }
+          }
+          $ver = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Service Fabric\' -Name FabricVersion -ErrorAction SilentlyContinue
+          Write-Host "FabricVersion now: $($ver.FabricVersion)"
           if (Test-Path -LiteralPath $env:FABRIC_CODE) {
             $dlls = Get-ChildItem -LiteralPath $env:FABRIC_CODE -Filter *.dll -File
             Write-Host "dll count: $($dlls.Count)"
