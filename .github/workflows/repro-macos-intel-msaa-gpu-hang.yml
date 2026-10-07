@@ -58,7 +58,14 @@ jobs:
       - name: Fingerprint VM
         run: |
           mkdir -p "$OUT_DIR"
+          job_start=$(date '+%Y-%m-%d %H:%M:%S')
+          boot_sec=$(sysctl -n kern.boottime | sed -E 's/.*sec = ([0-9]+),.*/\1/')
+          vm_boot=$(date -r "$boot_sec" '+%Y-%m-%d %H:%M:%S')
+          echo "JOB_START=$job_start" >> "$GITHUB_ENV"
+          echo "VM_BOOT=$vm_boot" >> "$GITHUB_ENV"
           {
+            echo "JobStart=$job_start"
+            echo "VmBoot=$vm_boot"
             echo "ImageVersion=${ImageVersion:-unknown}"
             echo "RunnerName=$RUNNER_NAME"
             echo "Hostname=$(hostname)"
@@ -88,11 +95,28 @@ jobs:
       - name: Collect kernel GPU log
         if: always()
         run: |
-          sudo log show --last 30m --style compact --predicate 'process == "kernel"' \
-            | grep -E 'AppleParavirtGPU|GPU hang|GPURestart|IOAccelEventMachine|already exists|new_resource' \
-            > "$OUT_DIR/kernel-gpu.log" || true
-          echo "Kernel GPU lines: $(wc -l < "$OUT_DIR/kernel-gpu.log")"
+          gpu_pattern='AppleParavirtGPU|GPU hang|GPURestart|IOAccelEventMachine|already exists|new_resource'
+          # Split at job start: faults before it happened without the probe running.
+          sudo log show --start "$VM_BOOT" --end "$JOB_START" --style compact --predicate 'process == "kernel"' \
+            | grep -E "$gpu_pattern" > "$OUT_DIR/kernel-gpu-pre-job.log" || true
+          sudo log show --start "$JOB_START" --style compact --predicate 'process == "kernel"' \
+            | grep -E "$gpu_pattern" > "$OUT_DIR/kernel-gpu.log" || true
+          echo "Pre-job fault lines ($VM_BOOT to $JOB_START): $(grep -c 'Fault on channel' "$OUT_DIR/kernel-gpu-pre-job.log" || true)"
+          echo "In-job kernel GPU lines (from $JOB_START): $(wc -l < "$OUT_DIR/kernel-gpu.log")"
           head -50 "$OUT_DIR/kernel-gpu.log"
+
+          # For the first few pre-job faults, keep every process's log lines around them to find the GPU client.
+          grep 'Fault on channel' "$OUT_DIR/kernel-gpu-pre-job.log" | cut -c1-19 | uniq | head -3 | while read -r ts; do
+            t=$(date -j -f '%Y-%m-%d %H:%M:%S' "$ts" +%s)
+            from=$(date -r $((t - 10)) '+%Y-%m-%d %H:%M:%S')
+            to=$(date -r $((t + 2)) '+%Y-%m-%d %H:%M:%S')
+            echo "=== fault at $ts (window $from to $to)"
+            sudo log show --start "$from" --end "$to" --style compact \
+              | grep -iE 'gpu|metal|windowserver|paravirt|restart|crash' | head -200
+          done > "$OUT_DIR/pre-job-fault-context.log" 2>&1 || true
+
+          ls /Library/Logs/DiagnosticReports 2>/dev/null | grep -i gpu \
+            | while read -r f; do cp "/Library/Logs/DiagnosticReports/$f" "$OUT_DIR/" 2>/dev/null || true; done
 
       - name: Write result row
         if: always()
@@ -110,11 +134,13 @@ jobs:
           fi
           kernel_faults=$(grep -cE 'Fault on channel|GPU hang' "$OUT_DIR/kernel-gpu.log" 2>/dev/null || true)
           kernel_faults=${kernel_faults:-0}
-          row="| ${{ matrix.runner }} | ${{ matrix.mode }} | ${{ matrix.rep }} | ${ImageVersion:-unknown} | $(sw_vers -productVersion) ($(sw_vers -buildVersion)) | $(sysctl -n hw.model) | $RUNNER_NAME | **$verdict** | ${phase_results:-n/a} | ${storm:-n/a} | $kernel_faults |"
+          pre_job_faults=$(grep -c 'Fault on channel' "$OUT_DIR/kernel-gpu-pre-job.log" 2>/dev/null || true)
+          pre_job_faults=${pre_job_faults:-0}
+          row="| ${{ matrix.runner }} | ${{ matrix.mode }} | ${{ matrix.rep }} | ${ImageVersion:-unknown} | $(sw_vers -productVersion) ($(sw_vers -buildVersion)) | $(sysctl -n hw.model) | $RUNNER_NAME | **$verdict** | ${phase_results:-n/a} | ${storm:-n/a} | $kernel_faults | $pre_job_faults |"
           echo "$row" > "$OUT_DIR/row.md"
           {
-            echo "| Runner | Mode | Rep | Image | Guest OS | hw.model | Runner name | Verdict | Phases | Storm | Kernel faults |"
-            echo "|---|---|---|---|---|---|---|---|---|---|---|"
+            echo "| Runner | Mode | Rep | Image | Guest OS | hw.model | Runner name | Verdict | Phases | Storm | Kernel faults | Pre-job faults |"
+            echo "|---|---|---|---|---|---|---|---|---|---|---|---|"
             echo "$row"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -144,8 +170,8 @@ jobs:
             echo
             echo "Phase seconds: $PHASE_SECONDS, storm seconds: $STORM_SECONDS"
             echo
-            echo "| Runner | Mode | Rep | Image | Guest OS | hw.model | Runner name | Verdict | Phases | Storm | Kernel faults |"
-            echo "|---|---|---|---|---|---|---|---|---|---|---|"
+            echo "| Runner | Mode | Rep | Image | Guest OS | hw.model | Runner name | Verdict | Phases | Storm | Kernel faults | Pre-job faults |"
+            echo "|---|---|---|---|---|---|---|---|---|---|---|---|"
             cat results/*/row.md 2>/dev/null | sort
             echo
             echo "### Failures by runner and mode"
