@@ -123,8 +123,8 @@ jobs:
         run: |
           probe_log="$OUT_DIR/probe.log"
           [ -f "$probe_log" ] || : > "$probe_log"
-          phase_results=$(grep -oE 'PROBE-SUMMARY (mode=[^ ]+ )?phase=[^ ]+ result=[^ ]+' "$probe_log" | grep -v 'phase=storm' | sed -E 's/.*phase=([^ ]+) result=([^ ]+)/\1:\2/' | paste -sd ' ' -)
-          storm=$(grep 'PROBE-SUMMARY phase=storm' "$probe_log" | grep -oE 'result=[^ ]+|textureNil=[0-9]+|viewNil=[0-9]+' | paste -sd ' ' -)
+          phase_results=$(grep -oE 'PROBE-SUMMARY (mode=[^ ]+ )?phase=[^ ]+ result=[^ ]+' "$probe_log" | grep -v 'phase=storm' | awk '!seen[$0]++' | sed -E 's/.*phase=([^ ]+) result=([^ ]+)/\1:\2/' | paste -sd ' ' -)
+          storm=$(grep 'PROBE-SUMMARY phase=storm' "$probe_log" | awk '!seen[$0]++' | grep -oE 'result=[^ ]+|textureNil=[0-9]+|viewNil=[0-9]+' | paste -sd ' ' -)
           if grep -qE 'PROBE-SUMMARY.*result=(hung|faults|stalled)' "$probe_log"; then
             verdict=FAIL
           elif [ -n "$phase_results" ]; then
