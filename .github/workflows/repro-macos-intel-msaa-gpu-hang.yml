@@ -1,0 +1,159 @@
+name: Repro macOS Intel MSAA GPU hang (#14836)
+
+# Reproduces https://github.com/actions/runner-images/issues/14836 with the reporter's
+# Metal-only probe and records each VM's fingerprint to help locate the faulting layer.
+# Expected if the paravirtual-GPU theory holds: Intel + fresh fails on most VMs,
+# Intel + fresh1x stays clean, and arm64 stays clean in every mode.
+
+on:
+  push:
+    branches:
+      - repro-14836-macos-intel-msaa-gpu-hang
+  workflow_dispatch:
+    inputs:
+      runners:
+        description: JSON list of runner labels
+        type: string
+        default: '["macos-15-intel","macos-26-intel","macos-15","macos-26"]'
+      modes:
+        description: JSON list of probe modes (fresh, fresh1x, reuse, paced)
+        type: string
+        default: '["fresh","fresh1x"]'
+      reps:
+        description: JSON list of repetition ids (one VM per entry)
+        type: string
+        default: '[1,2,3]'
+      phase_seconds:
+        description: Seconds per multisample phase
+        type: string
+        default: '210'
+      storm_seconds:
+        description: Seconds of the texture create storm between phases
+        type: string
+        default: '30'
+
+permissions:
+  contents: read
+
+env:
+  # Pinned to the commit referenced in the issue.
+  PROBE_URL: https://raw.githubusercontent.com/athei/mtld3d/98c1389f679c60207603ad18b547ed61e001915e/.github/probe/msaa_stress.swift
+  PHASE_SECONDS: ${{ inputs.phase_seconds || '210' }}
+  STORM_SECONDS: ${{ inputs.storm_seconds || '30' }}
+
+jobs:
+  probe:
+    name: ${{ matrix.runner }} / ${{ matrix.mode }} / ${{ matrix.rep }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(inputs.runners || '["macos-15-intel","macos-26-intel","macos-15","macos-26"]') }}
+        mode: ${{ fromJSON(inputs.modes || '["fresh","fresh1x"]') }}
+        rep: ${{ fromJSON(inputs.reps || '[1,2,3]') }}
+    env:
+      OUT_DIR: ${{ github.workspace }}/out
+    steps:
+      - name: Fingerprint VM
+        run: |
+          mkdir -p "$OUT_DIR"
+          {
+            echo "ImageVersion=${ImageVersion:-unknown}"
+            echo "RunnerName=$RUNNER_NAME"
+            echo "Hostname=$(hostname)"
+            sw_vers
+            uname -a
+            sysctl -n machdep.cpu.brand_string hw.model kern.hv_vmm_present hw.memsize
+            ioreg -rd1 -c IOPlatformExpertDevice | grep -E '"(model|manufacturer)"' || true
+            system_profiler SPDisplaysDataType
+            kmutil showloaded --list-only 2>/dev/null | grep -i paravirt || true
+            brew --version 2>/dev/null | head -1 || echo "brew not found"
+            xcrun swiftc --version
+          } 2>&1 | tee "$OUT_DIR/fingerprint.txt"
+
+      - name: Build probe
+        run: |
+          curl -fsSL --retry 3 -o msaa_stress.swift "$PROBE_URL"
+          xcrun swiftc -O -o msaa_probe msaa_stress.swift
+
+      - name: Run probe
+        id: probe
+        run: |
+          set -o pipefail
+          ./msaa_probe "$PHASE_SECONDS" "$STORM_SECONDS" "${{ matrix.mode }}" 2>&1 | tee "$OUT_DIR/probe.log"
+          # The probe always exits 0; turn a hang, stall or wrong result into a failed step.
+          ! grep -qE 'PROBE-SUMMARY.*result=(hung|faults|stalled)' "$OUT_DIR/probe.log"
+
+      - name: Collect kernel GPU log
+        if: always()
+        run: |
+          sudo log show --last 30m --style compact --predicate 'process == "kernel"' \
+            | grep -E 'AppleParavirtGPU|GPU hang|GPURestart|IOAccelEventMachine|already exists|new_resource' \
+            > "$OUT_DIR/kernel-gpu.log" || true
+          echo "Kernel GPU lines: $(wc -l < "$OUT_DIR/kernel-gpu.log")"
+          head -50 "$OUT_DIR/kernel-gpu.log"
+
+      - name: Write result row
+        if: always()
+        run: |
+          probe_log="$OUT_DIR/probe.log"
+          [ -f "$probe_log" ] || : > "$probe_log"
+          phase_results=$(grep -oE 'PROBE-SUMMARY (mode=[^ ]+ )?phase=[^ ]+ result=[^ ]+' "$probe_log" | grep -v 'phase=storm' | sed -E 's/.*phase=([^ ]+) result=([^ ]+)/\1:\2/' | paste -sd ' ' -)
+          storm=$(grep 'PROBE-SUMMARY phase=storm' "$probe_log" | grep -oE 'result=[^ ]+|textureNil=[0-9]+|viewNil=[0-9]+' | paste -sd ' ' -)
+          if grep -qE 'PROBE-SUMMARY.*result=(hung|faults|stalled)' "$probe_log"; then
+            verdict=FAIL
+          elif [ -n "$phase_results" ]; then
+            verdict=clean
+          else
+            verdict=incomplete
+          fi
+          kernel_faults=$(grep -cE 'Fault on channel|GPU hang' "$OUT_DIR/kernel-gpu.log" 2>/dev/null || true)
+          kernel_faults=${kernel_faults:-0}
+          row="| ${{ matrix.runner }} | ${{ matrix.mode }} | ${{ matrix.rep }} | ${ImageVersion:-unknown} | $(sw_vers -productVersion) ($(sw_vers -buildVersion)) | $(sysctl -n hw.model) | $RUNNER_NAME | **$verdict** | ${phase_results:-n/a} | ${storm:-n/a} | $kernel_faults |"
+          echo "$row" > "$OUT_DIR/row.md"
+          {
+            echo "| Runner | Mode | Rep | Image | Guest OS | hw.model | Runner name | Verdict | Phases | Storm | Kernel faults |"
+            echo "|---|---|---|---|---|---|---|---|---|---|---|"
+            echo "$row"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-${{ matrix.runner }}-${{ matrix.mode }}-${{ matrix.rep }}
+          path: out/
+          if-no-files-found: warn
+
+  summary:
+    needs: probe
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: probe-*
+          path: results
+
+      - name: Aggregate
+        run: |
+          {
+            echo "## #14836 probe results"
+            echo
+            echo "Phase seconds: $PHASE_SECONDS, storm seconds: $STORM_SECONDS"
+            echo
+            echo "| Runner | Mode | Rep | Image | Guest OS | hw.model | Runner name | Verdict | Phases | Storm | Kernel faults |"
+            echo "|---|---|---|---|---|---|---|---|---|---|---|"
+            cat results/*/row.md 2>/dev/null | sort
+            echo
+            echo "### Failures by runner and mode"
+            echo
+            echo "| Runner | Mode | Failed / total |"
+            echo "|---|---|---|"
+            cat results/*/row.md 2>/dev/null | awk -F'|' '{
+              key = $2 "|" $3; gsub(/ +/, " ", key); total[key]++
+              if ($9 ~ /FAIL/) failed[key]++
+            } END { for (k in total) printf "|%s| %d / %d |\n", k, failed[k] + 0, total[k] }' | sort
+          } >> "$GITHUB_STEP_SUMMARY"
