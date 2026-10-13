@@ -1,0 +1,26 @@
+name: Check pyjwt version
+
+# Verifies the python3-jwt package on hosted runners for actions/runner-images#14921
+on:
+  push:
+    branches:
+      - check-pyjwt-version
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-slim]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Print pyjwt package details
+        run: |
+          echo "Image: $ImageOS $ImageVersion"
+          dpkg-query -W -f='${Package} ${Version}\n' python3-jwt
+          python3 -c "import importlib.metadata as m; print(m.version('pyjwt'))"
+          zcat /usr/share/doc/python3-jwt/changelog.Debian.gz | grep -E '^pyjwt|CVE-' | head -8
