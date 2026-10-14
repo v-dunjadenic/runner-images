@@ -1,0 +1,129 @@
+# Temporary diagnostic workflow for https://github.com/actions/runner-images/issues/14924
+# Checks whether macOS runners can reliably reach api.apple-cloudkit.com (used by `xcrun stapler`).
+# Do not merge. Delete the branch when the investigation is done.
+name: Debug 14924 - CloudKit reachability
+
+on:
+  push:
+    branches: [debug/14924-cloudkit]
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: Requests per endpoint
+        default: '30'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: ${{ matrix.runner }} (${{ matrix.attempt }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-15-intel = affected; macos-26-intel = other Intel image; macos-15 = arm64 control
+        runner: [macos-15-intel, macos-26-intel, macos-15]
+        # Parallel jobs per label so we land on several different hosts
+        attempt: [1, 2, 3]
+    env:
+      ITERATIONS: ${{ inputs.iterations || '30' }}
+      RUNNER_LABEL: ${{ matrix.runner }}
+      CLOUDKIT_HOST: api.apple-cloudkit.com
+      CLOUDKIT_URL: https://api.apple-cloudkit.com/database/1/com.apple.gk.ticket-delivery/production/public/records/lookup
+      # The record name is a dummy; any HTTP response proves connectivity. Only transport errors count as failures.
+      CLOUDKIT_BODY: '{"records":[{"recordName":"2/2/0000000000000000000000000000000000000000"}]}'
+    steps:
+      - name: Runner info
+        run: |
+          sw_vers
+          echo "Arch: $(uname -m)"
+          echo "ImageOS=$ImageOS ImageVersion=$ImageVersion"
+          echo "Runner: $RUNNER_NAME"
+          curl --version | head -1
+
+      - name: Prepare probe helper
+        run: |
+          cat > "$RUNNER_TEMP/probe.sh" <<'EOF'
+          # Usage: probe <label> <iterations> <curl args...>
+          probe() {
+            local label="$1" n="$2"; shift 2
+            local ok=0 fail=0 out rc
+            for i in $(seq 1 "$n"); do
+              out=$(curl -sS -o /dev/null --max-time 20 \
+                -w 'http=%{http_code} ip=%{remote_ip} connect=%{time_connect}s tls=%{time_appconnect}s total=%{time_total}s' \
+                "$@" 2>&1) && rc=0 || rc=$?
+              if [ "$rc" -eq 0 ]; then ok=$((ok+1)); else fail=$((fail+1)); fi
+              echo "[$label] #$i rc=$rc $out"
+              sleep 1
+            done
+            echo "[$label] RESULT ok=$ok fail=$fail"
+            echo "| $RUNNER_LABEL | $label | $ok | $fail |" >> "$GITHUB_STEP_SUMMARY"
+            echo "$fail" >> "$RUNNER_TEMP/failures"
+          }
+          EOF
+          {
+            echo "### $RUNNER_LABEL ($ImageVersion)"
+            echo "| Runner | Probe | OK | Failed |"
+            echo "| --- | --- | --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: DNS resolution
+        run: |
+          for h in "$CLOUDKIT_HOST" timestamp.apple.com appstoreconnect.apple.com; do
+            echo "== $h"
+            dig +short "$h" || true
+          done
+
+      - name: Single verbose request (TLS details)
+        continue-on-error: true
+        run: |
+          curl -v -o /dev/null --max-time 20 -X POST -H 'Content-Type: application/json' \
+            -d "$CLOUDKIT_BODY" "$CLOUDKIT_URL"
+
+      - name: CloudKit ticket lookup (system DNS)
+        run: |
+          source "$RUNNER_TEMP/probe.sh"
+          probe "cloudkit" "$ITERATIONS" -X POST -H 'Content-Type: application/json' \
+            -d "$CLOUDKIT_BODY" "$CLOUDKIT_URL"
+
+      - name: CloudKit ticket lookup (IPs reported in the issue)
+        run: |
+          source "$RUNNER_TEMP/probe.sh"
+          for ip in 17.248.191.13 17.248.228.27 17.248.194.15 17.250.48.41; do
+            probe "cloudkit@$ip" 10 --resolve "$CLOUDKIT_HOST:443:$ip" \
+              -X POST -H 'Content-Type: application/json' -d "$CLOUDKIT_BODY" "$CLOUDKIT_URL"
+          done
+
+      - name: Control endpoints (timestamp + notary service)
+        run: |
+          source "$RUNNER_TEMP/probe.sh"
+          probe "timestamp.apple.com" 10 http://timestamp.apple.com/ts01
+          probe "notary-api" 10 https://appstoreconnect.apple.com/notary/v2/submissions
+
+      - name: End-to-end stapler (best effort)
+        continue-on-error: true
+        run: |
+          app="/Applications/Firefox.app"
+          if [ ! -d "$app" ]; then
+            echo "$app not found, skipping"; exit 0
+          fi
+          ditto "$app" "$RUNNER_TEMP/Firefox.app"
+          ok=0 fail=0
+          for i in $(seq 1 10); do
+            start=$(date +%s)
+            if xcrun stapler staple -v "$RUNNER_TEMP/Firefox.app" > "$RUNNER_TEMP/stapler.log" 2>&1; then
+              ok=$((ok+1)); echo "#$i OK ($(( $(date +%s) - start ))s)"
+            else
+              fail=$((fail+1)); echo "#$i FAILED ($(( $(date +%s) - start ))s)"
+              grep -E 'Error|error|NSURLErrorDomain' "$RUNNER_TEMP/stapler.log" | head -5 || true
+            fi
+          done
+          echo "| $RUNNER_LABEL | stapler staple (Firefox) | $ok | $fail |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verdict
+        run: |
+          total=$(awk '{s+=$1} END {print s+0}' "$RUNNER_TEMP/failures")
+          echo "Total transport failures: $total"
+          [ "$total" -eq 0 ]
