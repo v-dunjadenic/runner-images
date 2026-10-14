@@ -102,28 +102,52 @@ jobs:
           probe "timestamp.apple.com" 10 http://timestamp.apple.com/ts01
           probe "notary-api" 10 https://appstoreconnect.apple.com/notary/v2/submissions
 
-      - name: End-to-end stapler (best effort)
-        continue-on-error: true
+      - name: Prepare stapler helper
         run: |
-          app="/Applications/Firefox.app"
-          if [ ! -d "$app" ]; then
-            echo "$app not found, skipping"; exit 0
-          fi
-          ditto "$app" "$RUNNER_TEMP/Firefox.app"
-          ok=0 fail=0
-          for i in $(seq 1 10); do
-            start=$(date +%s)
-            if xcrun stapler staple -v "$RUNNER_TEMP/Firefox.app" > "$RUNNER_TEMP/stapler.log" 2>&1; then
-              ok=$((ok+1)); echo "#$i OK ($(( $(date +%s) - start ))s)"
-            else
-              fail=$((fail+1)); echo "#$i FAILED ($(( $(date +%s) - start ))s)"
-              grep -E 'Error|error|NSURLErrorDomain' "$RUNNER_TEMP/stapler.log" | head -5 || true
-            fi
-          done
-          echo "| $RUNNER_LABEL | stapler staple (Firefox) | $ok | $fail |" >> "$GITHUB_STEP_SUMMARY"
+          # Firefox is notarized by Mozilla; stapling a copy re-fetches its public ticket from CloudKit
+          ditto /Applications/Firefox.app "$RUNNER_TEMP/Firefox.app"
+          cat > "$RUNNER_TEMP/stapler.sh" <<'EOF'
+          # Usage: stapler_loop <label> <iterations>
+          stapler_loop() {
+            local label="$1" n="$2" ok=0 fail=0 start
+            for i in $(seq 1 "$n"); do
+              start=$(date +%s)
+              if xcrun stapler staple -v "$RUNNER_TEMP/Firefox.app" > "$RUNNER_TEMP/stapler.log" 2>&1; then
+                ok=$((ok+1)); echo "[$label] #$i OK ($(( $(date +%s) - start ))s)"
+              else
+                fail=$((fail+1)); echo "[$label] #$i FAILED ($(( $(date +%s) - start ))s)"
+                grep -E 'error is|Error 68' "$RUNNER_TEMP/stapler.log" | cut -c1-200 || true
+              fi
+            done
+            echo "[$label] RESULT ok=$ok fail=$fail"
+            echo "| $RUNNER_LABEL | $label | $ok | $fail |" >> "$GITHUB_STEP_SUMMARY"
+          }
+          EOF
+
+      - name: Stapler A - default networking (HTTP/3 allowed)
+        run: |
+          source "$RUNNER_TEMP/stapler.sh"
+          iface=$(route -n get default | awk '/interface:/{print $2}')
+          sudo tcpdump -i "$iface" -nn -w "$RUNNER_TEMP/udp443.pcap" udp port 443 > /dev/null 2>&1 &
+          tcpdump_pid=$!
+          sleep 2
+          stapler_loop "stapler (HTTP/3 allowed)" 20
+          sleep 1
+          sudo kill "$tcpdump_pid" || true
+          sleep 1
+          echo "UDP/443 (QUIC) packets seen during stapler runs: $(tcpdump -nn -r "$RUNNER_TEMP/udp443.pcap" 2>/dev/null | wc -l)"
+          tcpdump -nn -r "$RUNNER_TEMP/udp443.pcap" 2>/dev/null | awk '{print $3" > "$5}' | sort | uniq -c | sort -rn | head -10
+
+      - name: Stapler B - UDP/443 blocked (forces HTTP/2 over TCP)
+        run: |
+          source "$RUNNER_TEMP/stapler.sh"
+          echo "block return out quick proto udp from any to any port 443" | sudo pfctl -f - 2>/dev/null
+          sudo pfctl -E 2>/dev/null
+          sudo pfctl -sr 2>/dev/null
+          stapler_loop "stapler (UDP/443 blocked)" 20
 
       - name: Verdict
         run: |
           total=$(awk '{s+=$1} END {print s+0}' "$RUNNER_TEMP/failures")
-          echo "Total transport failures: $total"
+          echo "Total curl transport failures: $total"
           [ "$total" -eq 0 ]
