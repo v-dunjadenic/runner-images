@@ -1,0 +1,533 @@
+name: Repro CRI 51000002372789 (semantic-release on Ubuntu images)
+
+on:
+  push:
+    branches:
+      - test-cri-2610220030003255
+  workflow_dispatch:
+    inputs:
+      labels:
+        description: Comma-separated runner labels to probe
+        type: string
+        default: ubuntu-22.04,ubuntu-22.04-arm,ubuntu-24.04,ubuntu-24.04-arm,ubuntu-26.04,ubuntu-26.04-arm,ubuntu-slim
+      attempts:
+        description: Parallel jobs per label (1-30); more jobs increase the chance of hitting every image version
+        type: string
+        default: '5'
+      target_versions:
+        description: Comma-separated ubuntu-24.04 image versions the report must cover
+        type: string
+        default: 20261012.334.1,20261018.339.1,20261021.345.10
+      semantic_release_version:
+        description: semantic-release npm version
+        type: string
+        default: 25.0.9
+
+permissions:
+  contents: read
+
+# Push runs have no inputs, so every input falls back to these defaults
+env:
+  LABELS: ${{ inputs.labels || 'ubuntu-22.04,ubuntu-22.04-arm,ubuntu-24.04,ubuntu-24.04-arm,ubuntu-26.04,ubuntu-26.04-arm,ubuntu-slim' }}
+  ATTEMPTS: ${{ inputs.attempts || '5' }}
+  TARGET_VERSIONS: ${{ inputs.target_versions || '20261012.334.1,20261018.339.1,20261021.345.10' }}
+  SR_VERSION: ${{ inputs.semantic_release_version || '25.0.9' }}
+
+jobs:
+  prepare:
+    name: Prepare matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      labels: ${{ steps.matrix.outputs.labels }}
+      attempts: ${{ steps.matrix.outputs.attempts }}
+    steps:
+      - id: matrix
+        run: |
+          if ! [[ "$ATTEMPTS" =~ ^[0-9]+$ ]] || (( ATTEMPTS < 1 || ATTEMPTS > 30 )); then
+            echo "::error::attempts must be a number between 1 and 30"
+            exit 1
+          fi
+          labels=$(jq -cn --arg labels "$LABELS" '$labels | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))')
+          if [[ "$(jq 'length' <<< "$labels")" == 0 ]] || jq -e 'any(.[]; test("^[A-Za-z0-9._-]+$") | not)' <<< "$labels" > /dev/null; then
+            echo "::error::labels must be a comma-separated list of runner labels"
+            exit 1
+          fi
+          echo "labels=${labels}" >> "$GITHUB_OUTPUT"
+          echo "attempts=[$(seq -s, 1 "$ATTEMPTS")]" >> "$GITHUB_OUTPUT"
+
+  probe:
+    name: ${{ matrix.label }} / attempt ${{ matrix.attempt }}
+    needs: prepare
+    runs-on: ${{ matrix.label }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        label: ${{ fromJSON(needs.prepare.outputs.labels) }}
+        attempt: ${{ fromJSON(needs.prepare.outputs.attempts) }}
+    steps:
+      # ubuntu-slim ships fewer tools; install python3 if needed without touching curl or git
+      - name: Ensure python3
+        run: |
+          if ! command -v python3 > /dev/null; then
+            sudo_cmd=$([[ "$(id -u)" == 0 ]] && echo "" || echo "sudo")
+            $sudo_cmd apt-get update -qq
+            $sudo_cmd apt-get install -y -qq --no-install-recommends python3
+          fi
+          python3 --version
+
+      # Same Node.js major on every image so only curl/git differ between jobs
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install semantic-release
+        run: npm install --no-audit --no-fund --silent --prefix "$RUNNER_TEMP/sr" "semantic-release@${SR_VERSION}"
+
+      - name: Write local authenticated git server
+        run: |
+          mkdir -p "$RUNNER_TEMP/repro"
+          cat > "$RUNNER_TEMP/repro/server.py" <<'PY'
+          import base64
+          import json
+          import os
+          import subprocess
+          import sys
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+          root, log_path, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
+          token = os.environ["REPRO_TOKEN"]
+          backend = os.path.join(
+              subprocess.check_output(["git", "--exec-path"], text=True).strip(), "git-http-backend"
+          )
+
+
+          class Handler(BaseHTTPRequestHandler):
+              protocol_version = "HTTP/1.1"
+
+              def authorized_user(self):
+                  header = self.headers.get("Authorization", "")
+                  if not header.lower().startswith("basic "):
+                      return None
+                  try:
+                      user, _, password = base64.b64decode(header[6:]).decode().partition(":")
+                  except ValueError:
+                      return None
+                  # Like GitHub and Azure DevOps: accept the token as the username with an empty
+                  # password, or as the password with any username.
+                  if (user == token and password == "") or password == token:
+                      return user if password else "token"
+                  return None
+
+              def read_body(self):
+                  if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
+                      body = b""
+                      while True:
+                          size = int(self.rfile.readline().split(b";")[0].strip(), 16)
+                          if size == 0:
+                              self.rfile.readline()
+                              return body
+                          body += self.rfile.read(size)
+                          self.rfile.readline()
+                  length = int(self.headers.get("Content-Length") or 0)
+                  return self.rfile.read(length) if length else b""
+
+              def reply(self, status, headers, payload):
+                  self.send_response(status)
+                  for key, value in headers:
+                      self.send_header(key, value)
+                  self.send_header("Content-Length", str(len(payload)))
+                  self.end_headers()
+                  self.wfile.write(payload)
+
+              def handle_git(self):
+                  body = self.read_body()
+                  user = self.authorized_user()
+                  path, _, query = self.path.partition("?")
+                  with open(log_path, "a") as log:
+                      log.write(json.dumps({
+                          "method": self.command,
+                          "path": path,
+                          "query": query,
+                          "auth_header": "Authorization" in self.headers,
+                          "authorized": user is not None,
+                      }) + "\n")
+                  if user is None:
+                      self.reply(401, [("WWW-Authenticate", 'Basic realm="repro"')], b"")
+                      return
+                  env = {
+                      "PATH": os.environ["PATH"],
+                      "GIT_PROJECT_ROOT": root,
+                      "GIT_HTTP_EXPORT_ALL": "1",
+                      "GATEWAY_INTERFACE": "CGI/1.1",
+                      "SERVER_PROTOCOL": "HTTP/1.1",
+                      "REQUEST_METHOD": self.command,
+                      "PATH_INFO": path,
+                      "QUERY_STRING": query,
+                      "CONTENT_TYPE": self.headers.get("Content-Type", ""),
+                      "CONTENT_LENGTH": str(len(body)),
+                      "REMOTE_USER": user,
+                      "REMOTE_ADDR": "127.0.0.1",
+                  }
+                  for key, value in self.headers.items():
+                      env["HTTP_" + key.upper().replace("-", "_")] = value
+                  raw = subprocess.run([backend], input=body, env=env, capture_output=True).stdout
+                  head, _, payload = raw.partition(b"\r\n\r\n" if b"\r\n\r\n" in raw else b"\n\n")
+                  status, headers = 200, []
+                  for line in head.decode("latin-1").splitlines():
+                      key, _, value = line.partition(":")
+                      if key.lower() == "status":
+                          status = int(value.split()[0])
+                      elif key:
+                          headers.append((key, value.strip()))
+                  self.reply(status, headers, payload)
+
+              do_GET = do_POST = handle_git
+
+              def log_message(self, *args):
+                  pass
+
+
+          ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+          PY
+
+      - name: Probe git and semantic-release
+        env:
+          API_TOKEN: ${{ github.token }}
+          LABEL: ${{ matrix.label }}
+          ATTEMPT: ${{ matrix.attempt }}
+        run: |
+          # Scenarios are expected to fail on affected images, so do not stop on errors (GitHub uses bash -e)
+          set +e -uo pipefail
+          work="$RUNNER_TEMP/repro"
+          out="$RUNNER_TEMP/results"
+          mkdir -p "$work/srv" "$out"
+
+          port=8765
+          host="127.0.0.1:${port}"
+          url="http://${host}/repo.git"
+          # Throwaway credential that is only valid for the local server
+          token="ado$(head -c 20 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+          echo "::add-mask::${token}"
+          basic=$(printf 'x-access-token:%s' "$token" | base64 -w0)
+          sr_bin="$RUNNER_TEMP/sr/node_modules/semantic-release/bin/semantic-release.js"
+
+          # Image facts
+          image_version="${ImageVersion:-unknown}"
+          image_os="${ImageOS:-unknown}"
+          # Release tags look like ubuntu24/20261021.345, ubuntu24-arm64/20261021.157, ubuntu-slim/20261021.31
+          case "$LABEL" in
+            ubuntu-slim*) tag_prefix="ubuntu-slim" ;;
+            *-arm) tag_prefix="${image_os}-arm64" ;;
+            *) tag_prefix="$image_os" ;;
+          esac
+          release_tag="${tag_prefix}/${image_version%.*}"
+          echo "skipped" > "$out/release-status.txt"
+          [[ "$image_version" != unknown && "$image_os" != unknown ]] && curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${API_TOKEN}" \
+            "https://api.github.com/repos/actions/runner-images/git/ref/tags/${release_tag}" > "$out/release-status.txt"
+          dpkg-query -W -f='${Package}=${Version}\n' curl libcurl4 libcurl4t64 libcurl3-gnutls libcurl3t64-gnutls git openssh-client > "$out/packages.txt" 2>/dev/null
+          git --version > "$out/git-version.txt"
+          # The libcurl package git actually links against (libcurl3-gnutls on 22.04, libcurl3t64-gnutls later)
+          git_libcurl=$(ldd "$(git --exec-path)/git-remote-http" | awk '/libcurl/ {print $3; exit}')
+          git_libcurl_pkg=$(dpkg -S "$(readlink -f "$git_libcurl")" 2>/dev/null | head -1 | cut -d: -f1)
+          if [[ -n "$git_libcurl_pkg" ]]; then
+            dpkg-query -W -f='${Package}=${Version}\n' "$git_libcurl_pkg" > "$out/git-libcurl.txt"
+          else
+            echo "$git_libcurl" > "$out/git-libcurl.txt"
+          fi
+          echo "${RUNNER_ARCH:-unknown}" > "$out/arch.txt"
+
+          # Remote repository with a release tag followed by new commits
+          git init -q --bare -b main "$work/srv/repo.git"
+          seed="$work/seed"
+          git init -q -b main "$seed"
+          commit() { git -C "$seed" -c user.name=repro -c user.email=repro@example.com commit -q --allow-empty -m "$1"; }
+          printf '%s\n' '{"branches":["main"],"plugins":["@semantic-release/commit-analyzer","@semantic-release/release-notes-generator"]}' > "$seed/.releaserc.json"
+          git -C "$seed" add .releaserc.json
+          commit "chore: initial commit"
+          commit "fix: first fix"
+          commit "feat: first feature"
+          git -C "$seed" tag v1.0.0
+          commit "feat: feature after v1.0.0"
+          commit "fix: fix after v1.0.0"
+          git -C "$seed" push -q "$work/srv/repo.git" main v1.0.0
+
+          touch "$work/server.jsonl"
+          REPRO_TOKEN="$token" python3 "$work/server.py" "$work/srv" "$work/server.jsonl" "$port" > "$work/server.out" 2>&1 &
+          for _ in $(seq 1 50); do curl -s -o /dev/null "http://${host}/" && break; sleep 0.2; done
+          if ! git -c http.extraHeader="Authorization: Basic ${basic}" ls-remote "$url" > /dev/null 2> "$out/server-check.log"; then
+            echo "::error::Local git server is not working"
+            cat "$work/server.out" "$out/server-check.log"
+            exit 1
+          fi
+
+          # Azure Pipelines style checkout: depth 1, no tags, credentials as a header that is not persisted
+          checkout() {
+            git -c http.extraHeader="Authorization: Basic ${basic}" clone -q --depth 1 --no-tags --single-branch --branch main "$url" "$1"
+          }
+          # Runs semantic-release outside any known CI, like on Azure Pipelines (no GITHUB_ACTION)
+          sr() {
+            timeout 300 env -i PATH="$PATH" HOME="$HOME" GIT_TERMINAL_PROMPT=0 "$@" \
+              node "$sr_bin" --no-ci --dry-run --repository-url "$url"
+          }
+          raw_fetch() {
+            timeout 120 env GIT_TERMINAL_PROMPT=0 git fetch --unshallow --tags "$1"
+          }
+          scenario() {
+            local name=$1 dir="$work/$1"
+            shift
+            if ! checkout "$dir" > "$out/$name.log" 2>&1; then
+              echo 98 > "$out/$name.exit"
+              return
+            fi
+            if [[ "$name" == sr_persisted_header ]]; then
+              git -C "$dir" config http.extraheader "Authorization: Basic ${basic}"
+            fi
+            local before
+            before=$(wc -l < "$work/server.jsonl")
+            ( cd "$dir" && "$@" ) >> "$out/$name.log" 2>&1
+            echo $? > "$out/$name.exit"
+            tail -n +"$((before + 1))" "$work/server.jsonl" > "$out/$name.server.jsonl"
+            git -C "$dir" tag -l | paste -sd' ' > "$out/$name.tags"
+            git -C "$dir" rev-list --count HEAD > "$out/$name.commits"
+          }
+
+          scenario raw_token_only raw_fetch "http://${token}@${host}/repo.git"
+          scenario raw_user_token raw_fetch "http://x-access-token:${token}@${host}/repo.git"
+          scenario sr_token_only sr GIT_CREDENTIALS="$token"
+          scenario sr_user_token sr GIT_CREDENTIALS="x-access-token:${token}"
+          scenario sr_persisted_header sr
+
+          # Remove the token from logs before they are uploaded
+          for file in "$out"/*.log; do sed -i "s/${token}/<token>/g" "$file"; done
+
+          OUT="$out" IMAGE_VERSION="$image_version" IMAGE_OS="$image_os" RELEASE_TAG="$release_tag" python3 - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          out = Path(os.environ["OUT"])
+          expected_commits = 5
+          names = ("raw_token_only", "raw_user_token", "sr_token_only", "sr_user_token", "sr_persisted_header")
+          signatures = (
+              ("could not read Username", "could not read Username"),
+              ("warning: redirecting to", "false redirect"),
+              ("EGITNOPERMISSION", "EGITNOPERMISSION"),
+              ("No git tag version found", "no tags found"),
+          )
+
+
+          def read(name, default=""):
+              path = out / name
+              return path.read_text().strip() if path.exists() else default
+
+
+          def signature(log):
+              for needle, label in signatures:
+                  if needle in log:
+                      return label
+              match = re.search(r"^(fatal: .*|error: .*)$", log, re.M)
+              return match.group(1)[:160] if match else ""
+
+
+          def server(name):
+              requests = [json.loads(line) for line in read(f"{name}.server.jsonl").splitlines() if line.strip()]
+              return {
+                  "requests": len(requests),
+                  "with_auth_header": sum(r["auth_header"] for r in requests),
+                  "rejected_401": sum(not r["authorized"] for r in requests),
+              }
+
+
+          scenarios = {}
+          for name in names:
+              log = read(f"{name}.log")
+              exit_code = int(read(f"{name}.exit", "-1") or -1)
+              tags = read(f"{name}.tags").split()
+              commits = int(read(f"{name}.commits", "0") or 0)
+              entry = {
+                  "exit_code": exit_code,
+                  "tags_after": tags,
+                  "commits_after": commits,
+                  "signature": signature(log),
+                  "server": server(name),
+              }
+              if name.startswith("raw"):
+                  passed = exit_code == 0 and "v1.0.0" in tags and commits == expected_commits
+              else:
+                  match = re.search(r"The next release version is (\S+)", log)
+                  entry["found_tag"] = "Found git tag v1.0.0" in log
+                  entry["next_version"] = match.group(1) if match else None
+                  passed = exit_code == 0 and entry["found_tag"] and entry["next_version"] == "1.1.0"
+              entry["result"] = "PASS" if passed else "FAIL"
+              scenarios[name] = entry
+
+          result = {
+              "label": os.environ["LABEL"],
+              "attempt": int(os.environ["ATTEMPT"]),
+              "arch": read("arch.txt"),
+              "image_os": os.environ["IMAGE_OS"],
+              "image_version": os.environ["IMAGE_VERSION"],
+              "release_tag": os.environ["RELEASE_TAG"],
+              "release_http_status": read("release-status.txt"),
+              "packages": dict(
+                  line.split("=", 1) for line in read("packages.txt").splitlines() if "=" in line and not line.endswith("=")
+              ),
+              "git_version": read("git-version.txt"),
+              "git_libcurl": read("git-libcurl.txt"),
+              "scenarios": scenarios,
+          }
+          (out / "result.json").write_text(json.dumps(result, indent=2))
+
+          lines = [
+              f"### {result['label']} · {result['image_version']} (attempt {result['attempt']})",
+              "",
+              f"git libcurl `{result['git_libcurl']}` · git `{result['packages'].get('git', '?')}` · "
+              f"release tag `{result['release_tag']}` HTTP {result['release_http_status']}",
+              "",
+              "| Scenario | Result | Exit | Tags after | Commits after | Signature |",
+              "|---|---|---|---|---|---|",
+          ]
+          for name, entry in scenarios.items():
+              lines.append(
+                  f"| {name} | {entry['result']} | {entry['exit_code']} | {' '.join(entry['tags_after']) or '-'} | "
+                  f"{entry['commits_after']} | {entry['signature'] or '-'} |"
+              )
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write("\n".join(lines) + "\n")
+          print("\n".join(lines))
+          PY
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cri-repro-${{ matrix.label }}-${{ matrix.attempt }}
+          path: ${{ runner.temp }}/results
+          if-no-files-found: error
+
+  report:
+    name: Report by label and image version
+    needs: probe
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: cri-repro-*
+          path: results
+
+      - name: Build report
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from collections import Counter, defaultdict
+          from pathlib import Path
+
+          names = ("raw_token_only", "raw_user_token", "sr_token_only", "sr_user_token", "sr_persisted_header")
+          results = [json.loads(path.read_text()) for path in Path("results").glob("*/result.json")]
+          targets = [v.strip() for v in os.environ["TARGET_VERSIONS"].split(",") if v.strip()]
+          groups = defaultdict(list)
+          by_label = defaultdict(list)
+          for result in results:
+              groups[(result["label"], result["image_version"])].append(result)
+              by_label[result["label"]].append(result)
+
+
+          def cell(items, name):
+              entries = [item["scenarios"][name] for item in items]
+              passed = sum(entry["result"] == "PASS" for entry in entries)
+              text = f"{'✅' if passed == len(entries) else '❌'} {passed}/{len(entries)}"
+              failures = Counter(entry["signature"] or "unknown" for entry in entries if entry["result"] != "PASS")
+              if failures:
+                  text += " (" + ", ".join(f"{sig} ×{count}" for sig, count in failures.most_common(2)) + ")"
+              return text
+
+
+          lines = [
+              "# CRI 51000002372789: curl/git credential issue across Ubuntu images",
+              "",
+              f"{len(results)} jobs reported.",
+              "",
+              "## Does it reproduce per label?",
+              "",
+          ]
+          for label in sorted(by_label):
+              items = by_label[label]
+              failing = [
+                  item for item in items
+                  if "FAIL" in (item["scenarios"]["raw_token_only"]["result"], item["scenarios"]["sr_token_only"]["result"])
+              ]
+              control_failed = [item for item in items if item["scenarios"]["sr_persisted_header"]["result"] != "PASS"]
+              if control_failed:
+                  verdict = f"⚠️ inconclusive, control failed on {len(control_failed)}/{len(items)} jobs (check logs)"
+              elif failing:
+                  versions = ", ".join(sorted({item["image_version"] for item in failing}))
+                  verdict = f"❌ reproduces on {len(failing)}/{len(items)} jobs (image versions: {versions})"
+              else:
+                  verdict = f"✅ does not reproduce (0/{len(items)} jobs)"
+              lines.append(f"- `{label}`: {verdict}")
+
+          lines += [
+              "",
+              "## Results by label and image version",
+              "",
+              "| Label | Arch | Image version | Jobs | git libcurl | git | Release tag | raw fetch token-only | "
+              "raw fetch user:token | semantic-release token-only | semantic-release user:token | "
+              "semantic-release persisted header |",
+              "|---|---|---|---|---|---|---|---|---|---|---|---|",
+          ]
+          for label, version in sorted(groups):
+              items = groups[(label, version)]
+              first = items[0]
+              release = first["release_http_status"]
+              release_text = {"200": "present", "404": "missing", "skipped": "skipped"}.get(release, f"HTTP {release}")
+              lines.append(
+                  f"| {label} | {first['arch']} | {version} | {len(items)} | {first['git_libcurl']} | "
+                  f"{first['packages'].get('git', '?')} | {release_text} | "
+                  + " | ".join(cell(items, name) for name in names)
+                  + " |"
+              )
+
+          lines += ["", "## ubuntu-24.04 target version coverage", ""]
+          for target in targets:
+              hits = len(groups.get(("ubuntu-24.04", target), []))
+              lines.append(
+                  f"- {'✅' if hits else '⚠️'} `{target}`: "
+                  + (f"{hits} job(s)" if hits else "not hit, rerun with more attempts")
+              )
+
+          lines += [
+              "",
+              "## How to read this",
+              "",
+              "- **token-only** means credentials in the URL with an empty password (`https://<token>@host`). "
+              "semantic-release builds this URL from `GH_TOKEN`, from `GITHUB_TOKEN` outside GitHub Actions, "
+              "or from a `GIT_CREDENTIALS` value without a username.",
+              "- **user:token** means credentials in the URL with a username (`https://x-access-token:<token>@host`).",
+              "- **persisted header** means no credentials in the URL; git sends the checkout header "
+              "(Azure Pipelines `persistCredentials: true`).",
+              "- Each checkout starts like Azure Pipelines: depth 1 and no tags. A pass means semantic-release "
+              "found `v1.0.0` and calculated `1.1.0`.",
+              "- **Reproduces** means a token-only scenario failed while the persisted header control passed.",
+              "- Theory 1 (curl) holds if token-only fails only on image versions with the latest Ubuntu curl "
+              "security update (24.04: `8.5.0-2ubuntu10.16`), while persisted header passes.",
+              "- `ubuntu-slim` does not expose ImageVersion; check the job's Set up job > VM Image section.",
+              "- Theory 2 (missing release) holds if failures follow the **Release tag** column instead of curl.",
+          ]
+          report = "\n".join(lines) + "\n"
+          Path("results/report.md").write_text(report)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write(report)
+          print(report)
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cri-repro-report
+          path: results/report.md
+          if-no-files-found: error
