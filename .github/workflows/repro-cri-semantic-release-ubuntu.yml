@@ -1,4 +1,4 @@
-name: Repro CRI 51000002372789 (semantic-release on Ubuntu images)
+name: Repro CRI 51000002372789 (semantic-release on Ubuntu and macOS images)
 
 on:
   push:
@@ -9,7 +9,7 @@ on:
       labels:
         description: Comma-separated runner labels to probe
         type: string
-        default: ubuntu-22.04,ubuntu-22.04-arm,ubuntu-24.04,ubuntu-24.04-arm,ubuntu-26.04,ubuntu-26.04-arm,ubuntu-slim
+        default: ubuntu-22.04,ubuntu-22.04-arm,ubuntu-24.04,ubuntu-24.04-arm,ubuntu-26.04,ubuntu-26.04-arm,ubuntu-slim,macos-26,xcode-27
       attempts:
         description: Parallel jobs per label (1-30); more jobs increase the chance of hitting every image version
         type: string
@@ -28,7 +28,7 @@ permissions:
 
 # Push runs have no inputs, so every input falls back to these defaults
 env:
-  LABELS: ${{ inputs.labels || 'ubuntu-22.04,ubuntu-22.04-arm,ubuntu-24.04,ubuntu-24.04-arm,ubuntu-26.04,ubuntu-26.04-arm,ubuntu-slim' }}
+  LABELS: ${{ inputs.labels || 'ubuntu-22.04,ubuntu-22.04-arm,ubuntu-24.04,ubuntu-24.04-arm,ubuntu-26.04,ubuntu-26.04-arm,ubuntu-slim,macos-26,xcode-27' }}
   ATTEMPTS: ${{ inputs.attempts || '5' }}
   TARGET_VERSIONS: ${{ inputs.target_versions || '20261012.334.1,20261018.339.1,20261021.345.10' }}
   SR_VERSION: ${{ inputs.semantic_release_version || '25.0.9' }}
@@ -69,6 +69,7 @@ jobs:
     steps:
       # ubuntu-slim ships fewer tools; install python3 if needed without touching curl or git
       - name: Ensure python3
+        if: runner.os == 'Linux'
         run: |
           if ! command -v python3 > /dev/null; then
             sudo_cmd=$([[ "$(id -u)" == 0 ]] && echo "" || echo "sudo")
@@ -210,31 +211,50 @@ jobs:
           # Throwaway credential that is only valid for the local server
           token="ado$(head -c 20 /dev/urandom | od -An -tx1 | tr -d ' \n')"
           echo "::add-mask::${token}"
-          basic=$(printf 'x-access-token:%s' "$token" | base64 -w0)
+          basic=$(printf 'x-access-token:%s' "$token" | base64 | tr -d '\n')
           sr_bin="$RUNNER_TEMP/sr/node_modules/semantic-release/bin/semantic-release.js"
 
           # Image facts
           image_version="${ImageVersion:-unknown}"
           image_os="${ImageOS:-unknown}"
-          # Release tags look like ubuntu24/20261021.345, ubuntu24-arm64/20261021.157, ubuntu-slim/20261021.31
+          # Ubuntu release tags look like ubuntu24/20261021.345, ubuntu24-arm64/20261021.157, ubuntu-slim/20261021.31
           case "$LABEL" in
             ubuntu-slim*) tag_prefix="ubuntu-slim" ;;
             *-arm) tag_prefix="${image_os}-arm64" ;;
+            # macOS tags look like macos-26-arm64/20261021.0445 and xcode-27-arm64/20261022.0305
+            macos-*-intel) tag_prefix="${LABEL%-intel}" ;;
+            macos-* | xcode-*) tag_prefix="${LABEL}-arm64" ;;
             *) tag_prefix="$image_os" ;;
           esac
           release_tag="${tag_prefix}/${image_version%.*}"
           echo "skipped" > "$out/release-status.txt"
           [[ "$image_version" != unknown && "$image_os" != unknown ]] && curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${API_TOKEN}" \
             "https://api.github.com/repos/actions/runner-images/git/ref/tags/${release_tag}" > "$out/release-status.txt"
-          dpkg-query -W -f='${Package}=${Version}\n' curl libcurl4 libcurl4t64 libcurl3-gnutls libcurl3t64-gnutls git openssh-client > "$out/packages.txt" 2>/dev/null
           git --version > "$out/git-version.txt"
-          # The libcurl package git actually links against (libcurl3-gnutls on 22.04, libcurl3t64-gnutls later)
-          git_libcurl=$(ldd "$(git --exec-path)/git-remote-http" | awk '/libcurl/ {print $3; exit}')
-          git_libcurl_pkg=$(dpkg -S "$(readlink -f "$git_libcurl")" 2>/dev/null | head -1 | cut -d: -f1)
-          if [[ -n "$git_libcurl_pkg" ]]; then
-            dpkg-query -W -f='${Package}=${Version}\n' "$git_libcurl_pkg" > "$out/git-libcurl.txt"
+          git_remote_http="$(git --exec-path)/git-remote-http"
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            # Homebrew git can link the system libcurl or Homebrew's; report the curl that ships that library
+            git_libcurl=$(otool -L "$git_remote_http" | awk '/libcurl/ {print $1; exit}')
+            case "$git_libcurl" in
+              /usr/lib/*) libcurl_curl=/usr/bin/curl ;;
+              *) libcurl_curl="$(dirname "$git_libcurl")/../bin/curl" ;;
+            esac
+            libcurl_version=$("$libcurl_curl" --version 2>/dev/null | head -1 | awk '{print $2}')
+            echo "${git_libcurl}=${libcurl_version:-unknown}" > "$out/git-libcurl.txt"
+            {
+              echo "git=$(git --version | awk '{print $3}') ($(command -v git))"
+              echo "curl=$(curl --version | head -1 | awk '{print $2}') ($(command -v curl))"
+            } > "$out/packages.txt"
           else
-            echo "$git_libcurl" > "$out/git-libcurl.txt"
+            dpkg-query -W -f='${Package}=${Version}\n' curl libcurl4 libcurl4t64 libcurl3-gnutls libcurl3t64-gnutls git openssh-client > "$out/packages.txt" 2>/dev/null
+            # The libcurl package git actually links against (libcurl3-gnutls on 22.04, libcurl3t64-gnutls later)
+            git_libcurl=$(ldd "$git_remote_http" | awk '/libcurl/ {print $3; exit}')
+            git_libcurl_pkg=$(dpkg -S "$(readlink -f "$git_libcurl")" 2>/dev/null | head -1 | cut -d: -f1)
+            if [[ -n "$git_libcurl_pkg" ]]; then
+              dpkg-query -W -f='${Package}=${Version}\n' "$git_libcurl_pkg" > "$out/git-libcurl.txt"
+            else
+              echo "$git_libcurl" > "$out/git-libcurl.txt"
+            fi
           fi
           echo "${RUNNER_ARCH:-unknown}" > "$out/arch.txt"
 
@@ -267,12 +287,22 @@ jobs:
             git -c http.extraHeader="Authorization: Basic ${basic}" clone -q --depth 1 --no-tags --single-branch --branch main "$url" "$1"
           }
           # Runs semantic-release outside any known CI, like on Azure Pipelines (no GITHUB_ACTION)
+          # timeout is not installed on macOS; fall back to perl
+          with_timeout() {
+            local seconds=$1
+            shift
+            if command -v timeout > /dev/null; then
+              timeout "$seconds" "$@"
+            else
+              perl -e 'alarm shift @ARGV; exec @ARGV or die "exec failed: $!"' "$seconds" "$@"
+            fi
+          }
           sr() {
-            timeout 300 env -i PATH="$PATH" HOME="$HOME" GIT_TERMINAL_PROMPT=0 "$@" \
+            with_timeout 300 env -i PATH="$PATH" HOME="$HOME" GIT_TERMINAL_PROMPT=0 "$@" \
               node "$sr_bin" --no-ci --dry-run --repository-url "$url"
           }
           raw_fetch() {
-            timeout 120 env GIT_TERMINAL_PROMPT=0 git fetch --unshallow --tags "$1"
+            with_timeout 120 env GIT_TERMINAL_PROMPT=0 git fetch --unshallow --tags "$1"
           }
           scenario() {
             local name=$1 dir="$work/$1"
@@ -289,7 +319,7 @@ jobs:
             ( cd "$dir" && "$@" ) >> "$out/$name.log" 2>&1
             echo $? > "$out/$name.exit"
             tail -n +"$((before + 1))" "$work/server.jsonl" > "$out/$name.server.jsonl"
-            git -C "$dir" tag -l | paste -sd' ' > "$out/$name.tags"
+            git -C "$dir" tag -l | paste -sd' ' - > "$out/$name.tags"
             git -C "$dir" rev-list --count HEAD > "$out/$name.commits"
           }
 
@@ -300,7 +330,7 @@ jobs:
           scenario sr_persisted_header sr
 
           # Remove the token from logs before they are uploaded
-          for file in "$out"/*.log; do sed -i "s/${token}/<token>/g" "$file"; done
+          for file in "$out"/*.log; do perl -pi -e "s/${token}/<token>/g" "$file"; done
 
           OUT="$out" IMAGE_VERSION="$image_version" IMAGE_OS="$image_os" RELEASE_TAG="$release_tag" python3 - <<'PY'
           import json
@@ -449,7 +479,7 @@ jobs:
 
 
           lines = [
-              "# CRI 51000002372789: curl/git credential issue across Ubuntu images",
+              "# CRI 51000002372789: curl/git credential issue across Ubuntu and macOS images",
               "",
               f"{len(results)} jobs reported.",
               "",
@@ -517,6 +547,7 @@ jobs:
               "- Theory 1 (curl) holds if token-only fails only on image versions with the latest Ubuntu curl "
               "security update (24.04: `8.5.0-2ubuntu10.16`), while persisted header passes.",
               "- `ubuntu-slim` does not expose ImageVersion; check the job's Set up job > VM Image section.",
+              "- On macOS, **git libcurl** is the libcurl git links against and the version of the curl that ships it.",
               "- Theory 2 (missing release) holds if failures follow the **Release tag** column instead of curl.",
           ]
           report = "\n".join(lines) + "\n"
