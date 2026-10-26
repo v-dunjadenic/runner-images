@@ -1,0 +1,153 @@
+name: Repro Metal exit-without-wait GPU fault (#14836)
+
+# Reproduces the follow-up trigger reported in
+# https://github.com/actions/runner-images/issues/14836#issuecomment-6390971649 :
+# a process presents to a windowless CAMetalLayer and exits without waiting for its
+# last command buffer, which faults the shared paravirtual GPU channel and stalls or
+# fails other processes' GPU work. The reporter's harness runs four 45 s phases:
+#   none              - victims only, no trigger (control)
+#   present           - victims + trigger that exits without waiting
+#   present-wait-last - victims + trigger that waits on its last buffer (proposed workaround)
+#   present-novictims - trigger only
+# Expected per the reporter: faults in present/present-novictims on arm64 (rare on
+# Intel), and zero faults in none and present-wait-last everywhere.
+
+on:
+  push:
+    branches:
+      - repro-14836-macos-intel-msaa-gpu-hang
+  workflow_dispatch:
+    inputs:
+      runners:
+        description: JSON list of runner labels
+        type: string
+        default: '["macos-14","macos-15","macos-26","macos-15-intel","macos-26-intel"]'
+      reps:
+        description: JSON list of repetition ids (one VM per entry)
+        type: string
+        default: '[1,2]'
+
+permissions:
+  contents: read
+
+env:
+  # Pinned to the commit used for the reporter's runs 40139629035 and 40139630731.
+  REPRO_BASE_URL: https://raw.githubusercontent.com/maplibre/maplibre-native-ffi/80e4b9e84979db326151f25a161bd98f38ef250e/.github/repro
+
+jobs:
+  repro:
+    name: ${{ matrix.runner }} / ${{ matrix.rep }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(inputs.runners || '["macos-14","macos-15","macos-26","macos-15-intel","macos-26-intel"]') }}
+        rep: ${{ fromJSON(inputs.reps || '[1,2]') }}
+    env:
+      OUT_DIR: out
+    steps:
+      - name: Download reporter's harness
+        run: |
+          mkdir -p .github/repro "$OUT_DIR"
+          for f in minimal.m run.sh; do
+            curl -fsSL --retry 3 -o ".github/repro/$f" "$REPRO_BASE_URL/$f"
+          done
+          # run.sh collects a sysdiagnose after the first faulting phase; that takes minutes
+          # and is not needed here, and the marker file makes it skip that step.
+          echo "skipped by runner-images repro" > "$OUT_DIR/sysdiagnose.done"
+
+      - name: Run harness
+        run: bash .github/repro/run.sh "${{ matrix.runner }}" "$OUT_DIR"
+
+      - name: Write result row
+        if: always()
+        run: |
+          results="$OUT_DIR/results.tsv"
+          [ -f "$results" ] || : > "$results"
+
+          # Prints "<field value>" for a phase, or "-" when the phase is missing.
+          field() {
+            awk -F'\t' -v phase="$1" -v key="$2" '
+              $1 == "RESULT" && $3 == phase {
+                for (i = 4; i <= NF; i++) { split($i, kv, "="); if (kv[1] == key) { print kv[2]; found = 1 } }
+              }
+              END { if (!found) print "-" }' "$results"
+          }
+          cell() { echo "$(field "$1" faults) ($(field "$1" victim_fail))"; }
+
+          none_faults=$(field none faults)
+          present_faults=$(field present faults)
+          present_vfail=$(field present victim_fail)
+          wait_faults=$(field present-wait-last faults)
+          novictim_faults=$(field present-novictims faults)
+
+          if grep -q 'no-metal-device' "$results"; then
+            verdict=no-metal-device
+          elif [ "$none_faults" = - ] || [ "$present_faults" = - ] || [ "$wait_faults" = - ] || [ "$novictim_faults" = - ]; then
+            verdict=incomplete
+          elif [ "$present_faults" -gt 0 ] || [ "$present_vfail" -gt 0 ] || [ "$novictim_faults" -gt 0 ]; then
+            verdict=REPRODUCED
+          else
+            verdict=not-reproduced
+          fi
+          # Faults in the control or workaround phases would contradict the reported pattern.
+          note=
+          if [ "$none_faults" != - ] && [ "$none_faults" -gt 0 ]; then note="control faulted"; fi
+          if [ "$wait_faults" != - ] && [ "$wait_faults" -gt 0 ]; then note="${note:+$note, }wait-last faulted"; fi
+
+          row="| ${{ matrix.runner }} | ${{ matrix.rep }} | ${ImageVersion:-unknown} | $(sw_vers -productVersion) | $(sysctl -n hw.model) | **$verdict** | $(cell none) | $(cell present) | $(cell present-wait-last) | $(field present-novictims faults) | $(field none victim_buffers) → $(field present victim_buffers) | ${note:-none} |"
+          echo "$row" > "$OUT_DIR/row.md"
+          echo "VERDICT=$verdict" >> "$GITHUB_ENV"
+          {
+            echo "| Runner | Rep | Image | Guest OS | hw.model | Verdict | No trigger | Exit without wait | Wait on last, then exit | Exit without wait, no victims | Victim buffers (none → present) | Unexpected |"
+            echo "|---|---|---|---|---|---|---|---|---|---|---|---|"
+            echo "$row"
+            echo
+            echo "Cells are guest GPU faults, with failed victim command buffers in parentheses."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: repro-${{ matrix.runner }}-${{ matrix.rep }}
+          path: out/
+          if-no-files-found: warn
+
+      - name: Fail when reproduced
+        run: |
+          echo "Verdict: $VERDICT"
+          [ "$VERDICT" != REPRODUCED ]
+
+  summary:
+    needs: repro
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: repro-*
+          path: results
+
+      - name: Aggregate
+        run: |
+          {
+            echo "## #14836 exit-without-wait results"
+            echo
+            echo "Cells are guest GPU faults, with failed victim command buffers in parentheses."
+            echo
+            echo "| Runner | Rep | Image | Guest OS | hw.model | Verdict | No trigger | Exit without wait | Wait on last, then exit | Exit without wait, no victims | Victim buffers (none → present) | Unexpected |"
+            echo "|---|---|---|---|---|---|---|---|---|---|---|---|"
+            cat results/*/row.md 2>/dev/null | sort
+            echo
+            echo "### Reproduced by runner"
+            echo
+            echo "| Runner | Reproduced / total |"
+            echo "|---|---|"
+            cat results/*/row.md 2>/dev/null | awk -F'|' '{
+              key = $2; gsub(/ +/, " ", key); total[key]++
+              if ($7 ~ /REPRODUCED/) hit[key]++
+            } END { for (k in total) printf "|%s| %d / %d |\n", k, hit[k] + 0, total[k] }' | sort
+          } >> "$GITHUB_STEP_SUMMARY"
