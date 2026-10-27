@@ -174,8 +174,10 @@ jobs:
                   return "failed"
               if conclusion == "cancelled" and job["started_at"] and job["completed_at"]:
                   if (ts(job["completed_at"]) - ts(job["started_at"])).total_seconds() >= timeout_s - 30:
-                      # The reporter's frozen jobs have no step records; a normal timeout keeps them.
-                      return "frozen" if not job["steps"] else "timed out"
+                      # Frozen jobs have no step records, or steps that never finished. A normal
+                      # timeout cancels the running step, so all of its steps end up completed.
+                      stuck = not job["steps"] or any(s["status"] != "completed" for s in job["steps"])
+                      return "frozen" if stuck else "timed out"
               return "other"
 
           def count(run_ids):
