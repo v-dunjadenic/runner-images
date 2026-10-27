@@ -15,7 +15,7 @@ on:
         default: '32'
   push:
     branches:
-      - wsl-docker-ab
+      - test-wsl2-provisioning-freeze
 permissions:
   contents: read
 env:
