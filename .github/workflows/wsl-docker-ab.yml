@@ -1,0 +1,241 @@
+# A/B test for actions/runner-images#14938: does the Windows Docker service that the image starts
+# at boot make WSL2 provisioning freeze? Both arms copy the reporter's experiment
+# (Particular/ServiceControl#6007); the only difference is that the docker-off arm stops and
+# disables the Docker service before anything else runs.
+#
+# A frozen job is cancelled at the job timeout and has no step records. The Summary job counts
+# them per arm, for this run and for every earlier run of this workflow.
+name: WSL Docker A/B test
+on:
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: Iterations per arm and category (1-32). 32 gives 256 jobs, 128 per arm.
+        required: false
+        default: '32'
+  push:
+    branches:
+      - wsl-docker-ab
+permissions:
+  contents: read
+env:
+  DOTNET_NOLOGO: true
+defaults:
+  run:
+    shell: pwsh
+jobs:
+  matrix:
+    name: Build matrix
+    runs-on: ubuntu-latest
+    outputs:
+      iterations: ${{ steps.iterations.outputs.list }}
+    steps:
+      - name: Build iteration list
+        id: iterations
+        shell: bash
+        env:
+          ITERATIONS: ${{ inputs.iterations || '32' }}
+        run: |
+          # GitHub allows at most 256 jobs per matrix: 2 arms x 4 categories x 32 iterations.
+          if ! [[ "$ITERATIONS" =~ ^[0-9]+$ ]] || (( ITERATIONS < 1 || ITERATIONS > 32 )); then
+            echo "::error::iterations must be between 1 and 32, got '$ITERATIONS'"
+            exit 1
+          fi
+          echo "list=[$(seq 1 "$ITERATIONS" | paste -sd, -)]" >> "$GITHUB_OUTPUT"
+
+  probe:
+    name: ${{ matrix.arm }}-${{ matrix.category }}-${{ matrix.iteration }}
+    needs: matrix
+    runs-on: windows-latest
+    # A healthy job finishes in about six minutes. Keep in sync with PROBE_TIMEOUT_MINUTES below.
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        arm: [ docker-on, docker-off ]
+        category: [ SqlServer, PostgreSql, RabbitMQ, IBMMQ ]
+        iteration: ${{ fromJSON(needs.matrix.outputs.iterations) }}
+    steps:
+      - name: Checkout ServiceControl (build load only)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Particular/ServiceControl
+          ref: d419245283baa73a2cb5c19f85272cdb4021af49
+          fetch-depth: 0
+
+      - name: Runner and Docker state
+        run: |
+          Write-Host "ImageOS=$env:ImageOS ImageVersion=$env:ImageVersion Arm=${{ matrix.arm }}"
+          (wsl.exe --version) -replace "`0", '' | Where-Object { $_ } | Out-Host
+          $service = Get-Service -Name docker -ErrorAction SilentlyContinue
+          Write-Host "Docker service: status=$($service.Status) startType=$($service.StartType)"
+          Write-Host "dockerd running: $([bool](Get-Process -Name dockerd -ErrorAction SilentlyContinue))"
+          if (Get-Command hnsdiag.exe -ErrorAction SilentlyContinue) { hnsdiag.exe list networks } else { Write-Host 'hnsdiag.exe not available' }
+          $global:LASTEXITCODE = 0
+
+      - name: Stop and disable Docker
+        if: matrix.arm == 'docker-off'
+        run: |
+          Stop-Service -Name docker -Force
+          Set-Service -Name docker -StartupType Disabled
+          (Get-Service -Name docker).WaitForStatus('Stopped', '00:01:00')
+          if (Get-Process -Name dockerd -ErrorAction SilentlyContinue) {
+            throw 'dockerd is still running after stopping the docker service'
+          }
+          $service = Get-Service -Name docker
+          Write-Host "Docker service: status=$($service.Status) startType=$($service.StartType)"
+
+      # Same NuGet cache location and build as the reporter, to create the same load during WSL setup.
+      - name: Move NuGet caches to the temp drive
+        run: |
+          $packages = Join-Path $Env:RUNNER_TEMP 'nuget\packages'
+          $httpCache = Join-Path $Env:RUNNER_TEMP 'nuget\http-cache'
+          New-Item -ItemType Directory -Force -Path $packages, $httpCache | Out-Null
+          "NUGET_PACKAGES=$packages" >> $Env:GITHUB_ENV
+          "NUGET_HTTP_CACHE_PATH=$httpCache" >> $Env:GITHUB_ENV
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          global-json-file: global.json
+
+      - name: Select test projects
+        run: ./tools/select-test-projects.ps1 -Category ${{ matrix.category }}
+
+      - name: Build
+        id: build
+        background: true
+        timeout-minutes: 5
+        run: dotnet build tests.proj --configuration Release -graph -p:NuGetAudit=false
+
+      - name: Setup WSL
+        uses: Particular/setup-wsl-action@7e67069143b27e935a5c156d4c5319a7f152f6e8
+        timeout-minutes: 5
+        with:
+          memory: 8GB
+          enable-cache: false
+
+      - name: Wait for build
+        wait: build
+
+      - name: Check Docker stayed stopped
+        if: matrix.arm == 'docker-off'
+        run: |
+          $service = Get-Service -Name docker
+          Write-Host "Docker service: status=$($service.Status) startType=$($service.StartType)"
+          if ($service.Status -ne 'Stopped' -or (Get-Process -Name dockerd -ErrorAction SilentlyContinue)) {
+            throw 'Docker was running again by the end of the job, so this job does not count for the docker-off arm'
+          }
+
+  summary:
+    name: Summary
+    needs: [ matrix, probe ]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    steps:
+      - name: Count frozen jobs per arm
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          PROBE_TIMEOUT_MINUTES: 15
+          ARM_A: docker-on
+          ARM_B: docker-off
+        run: |
+          python3 - <<'EOF'
+          import json, math, os, subprocess, time
+          from datetime import datetime
+
+          repo, run_id = os.environ["REPO"], os.environ["RUN_ID"]
+          timeout_s = int(os.environ["PROBE_TIMEOUT_MINUTES"]) * 60
+          arm_a, arm_b = os.environ["ARM_A"], os.environ["ARM_B"]
+          kinds = ["success", "frozen", "timed out", "failed", "other"]
+
+          def api(path, attempts=4):
+              for attempt in range(1, attempts + 1):
+                  result = subprocess.run(["gh", "api", "--paginate", "--slurp", path], capture_output=True, text=True)
+                  if result.returncode == 0:
+                      return json.loads(result.stdout)
+                  if attempt == attempts:
+                      raise RuntimeError(f"gh api {path} failed: {result.stderr.strip()}")
+                  time.sleep(5 * attempt)
+
+          def ts(value):
+              return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+          def classify(job):
+              conclusion = job["conclusion"]
+              if conclusion == "success":
+                  return "success"
+              if conclusion == "failure":
+                  return "failed"
+              if conclusion == "cancelled" and job["started_at"] and job["completed_at"]:
+                  if (ts(job["completed_at"]) - ts(job["started_at"])).total_seconds() >= timeout_s - 30:
+                      # The reporter's frozen jobs have no step records; a normal timeout keeps them.
+                      return "frozen" if not job["steps"] else "timed out"
+              return "other"
+
+          def count(run_ids):
+              totals = {arm: dict.fromkeys(kinds, 0) for arm in (arm_a, arm_b)}
+              frozen = []
+              for rid in run_ids:
+                  try:
+                      pages = api(f"repos/{repo}/actions/runs/{rid}/jobs?filter=latest&per_page=100")
+                  except RuntimeError as error:
+                      print(f"::warning::Skipping run {rid}: {error}")
+                      continue
+                  for page in pages:
+                      for job in page["jobs"]:
+                          arm = job["name"].rsplit("-", 2)[0]
+                          if arm not in totals or job["status"] != "completed":
+                              continue
+                          kind = classify(job)
+                          totals[arm][kind] += 1
+                          if kind == "frozen":
+                              frozen.append(f"[{job['name']}]({job['html_url']})")
+              return totals, frozen
+
+          def one_sided_fisher(a_frozen, a_total, b_frozen, b_total):
+              # Chance of seeing at least this many arm-A freezes if both arms had the same freeze rate.
+              k, n = a_frozen + b_frozen, a_total + b_total
+              if k == 0:
+                  return 1.0
+              hits = sum(math.comb(a_total, x) * math.comb(b_total, k - x)
+                         for x in range(a_frozen, min(a_total, k) + 1))
+              return hits / math.comb(n, k)
+
+          def table(title, totals, frozen):
+              lines = [f"### {title}", "",
+                       "| Arm | Jobs | " + " | ".join(kinds) + " | Frozen rate |",
+                       "|---|---|" + "---|" * len(kinds) + "---|"]
+              for arm, c in totals.items():
+                  jobs = sum(c.values())
+                  rate = f"{100 * c['frozen'] / jobs:.1f}%" if jobs else "n/a"
+                  lines.append(f"| {arm} | {jobs} | " + " | ".join(str(c[k]) for k in kinds) + f" | {rate} |")
+              a, b = totals[arm_a], totals[arm_b]
+              a_total, b_total = sum(a.values()), sum(b.values())
+              p = one_sided_fisher(a["frozen"], a_total, b["frozen"], b_total)
+              lines += ["", f"One-sided Fisher exact p-value ({arm_a} freezes more than {arm_b}): **{p:.3f}**", ""]
+              if b["frozen"] > 0:
+                  lines.append(f"Result: {arm_b} jobs froze too, so a running Docker service is not needed for the freeze.")
+              elif a["frozen"] > 0 and p < 0.05:
+                  lines.append(f"Result: only {arm_a} jobs froze and the difference is significant, so Docker is likely involved.")
+              else:
+                  lines.append("Result: not enough freezes yet to tell the arms apart. Run the workflow again.")
+              if frozen:
+                  lines += ["", "Frozen jobs: " + ", ".join(frozen)]
+              return "\n".join(lines) + "\n\n"
+
+          run = api(f"repos/{repo}/actions/runs/{run_id}")[0]
+          earlier = [r["id"] for page in api(f"repos/{repo}/actions/workflows/{run['workflow_id']}/runs?status=completed&per_page=100")
+                     for r in page["workflow_runs"] if r["id"] != run["id"]]
+
+          summary = table("This run", *count([run["id"]]))
+          summary += table(f"All runs so far ({len(earlier) + 1})", *count([run["id"]] + earlier))
+          print(summary)
+          with open(os.environ.get("GITHUB_STEP_SUMMARY", os.devnull), "a") as f:
+              f.write(summary)
+          EOF
