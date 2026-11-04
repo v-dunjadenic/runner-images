@@ -279,15 +279,43 @@ def diagnostics():
     diag["etc_ssl"] = stdout.strip().splitlines()[:15]
     certs_dir = Path("/private/etc/ssl/certs")
     diag["etc_ssl_certs_files"] = len(list(certs_dir.iterdir())) if certs_dir.is_dir() else None
+    keychains = {}
+    for name in ("AAA Certificate Services", "emSign ECC Root CA - G3", "emSign Root TLS CA - G3"):
+        _, stdout, _ = run(
+            ["/usr/bin/security", "find-certificate", "-a", "-c", name, "-Z",
+             "/System/Library/Keychains/SystemRootCertificates.keychain"], timeout=20,
+        )
+        keychains[name] = stdout.count("SHA-256 hash:")
+    diag["system_root_keychain_matches"] = keychains
+    _, stdout, stderr = run(["/usr/bin/security", "dump-trust-settings", "-d"], timeout=20)
+    diag["admin_trust_settings"] = (stdout or stderr).strip().splitlines()[:6]
     return diag
 
 
-def add(checks, seen, check_id, category, kind, executable=None, bundle=None):
-    key = (kind, os.path.realpath(executable) if executable else None, os.path.realpath(bundle) if bundle else None)
+def add(checks, seen, check_id, category, kind, executable=None, bundle=None, cafile=None):
+    key = (kind, os.path.realpath(executable) if executable else None, os.path.realpath(bundle) if bundle else None, cafile)
     if key in seen:
         return
     seen.add(key)
-    checks.append({"id": check_id, "category": category, "kind": kind, "executable": executable, "bundle": bundle})
+    checks.append({
+        "id": check_id, "category": category, "kind": kind, "executable": executable, "bundle": bundle, "cafile": cafile,
+    })
+
+
+def unrelated_ca_file():
+    """Write a CA file with one root unrelated to eMudhra, taken from /etc/ssl/cert.pem."""
+    try:
+        text = Path("/etc/ssl/cert.pem").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for match in re.finditer(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", text, re.S):
+        header = text[max(0, match.start() - 300):match.start()]
+        if not re.search(r"emSign|eMudhra|AAA Certificate|Comodo|USERTrust|Sectigo", header):
+            OUTPUT.mkdir(parents=True, exist_ok=True)
+            path = OUTPUT / "unrelated-ca.pem"
+            path.write_text(match.group(0) + "\n", encoding="utf-8")
+            return str(path)
+    return None
 
 
 def plan_checks():
@@ -324,7 +352,14 @@ def plan_checks():
         pip = pip_bundle("/usr/bin/python3")
         if pip:
             add(checks, seen, "Apple pip bundle (%s)" % pip, "own-store", "bundle", bundle=pip)
-    elif SYSTEM == "Linux":
+        # If these accept while the CA file holds no related root, Apple's TLS stack trusts the chain
+        # from somewhere other than the CA file (for example the macOS keychain).
+        unrelated = unrelated_ca_file()
+        if unrelated:
+            add(checks, seen, "Fallback test: Apple curl with an unrelated CA file", "diagnostic", "curl",
+                "/usr/bin/curl", cafile=unrelated)
+            add(checks, seen, "Fallback test: Apple python3 with an unrelated CA file", "diagnostic", "python",
+                "/usr/bin/python3", cafile=unrelated)
         for name in ("curl", "git"):
             found = shutil.which(name)
             if found:
@@ -361,13 +396,13 @@ def execute(check):
         return check
     if kind == "curl":
         check["version"] = tool_version([executable, "--version"])
-        check["targets"] = curl_targets(executable)
+        check["targets"] = curl_targets(executable, ("--cacert", check["cafile"]) if check.get("cafile") else ())
     elif kind == "git":
         check["version"] = tool_version([executable, "--version"])
         check["targets"] = git_targets(executable)
     elif kind == "python":
         check["version"] = tool_version([executable, "--version"])
-        check["targets"] = python_targets(executable)
+        check["targets"] = python_targets(executable, check.get("cafile") or "")
     elif kind == "node":
         check["version"] = tool_version([executable, "--version"])
         check["targets"] = node_targets(executable)
@@ -455,6 +490,7 @@ def do_probe():
     result["verdict"] = verdict(checks)
     result["accepted_high"] = accepted(checks, HIGH_SEVERITY)
     result["accepted_other"] = accepted(checks, ("own-store",))
+    result["fallback_accepted"] = accepted(checks, ("diagnostic",))
     text = json.dumps(result, indent=2)
     (OUTPUT / "result.json").write_text(text + "\n", encoding="utf-8")
     print(text)
@@ -485,6 +521,9 @@ def do_report(directory):
         "**REJECTED** = certificate verification failed (protected).",
         "- **VULNERABLE** = at least one `system` or `homebrew` check accepted a chain. `own-store` tools "
         "(pip, Node.js) ship their own CA list and are listed for information only.",
+        "- **Fallback test** rows run Apple curl/python3 with a CA file holding one unrelated root. ACCEPTED "
+        "there means Apple's TLS stack trusted the chain from somewhere other than the CA file "
+        "(for example the macOS keychain), so pruning `/etc/ssl/cert.pem` alone is not enough on that VM.",
         "- **G3** and **AAA** are the two test chains. **git check repo** is the git test from the "
         "disclosure site. Bundle rows test the file on its own as the only trust store.",
         "- MacCloud's VM-startup fix applies to VMs created after its rollout (Nov 3, about 17:00 UTC). "
@@ -492,14 +531,15 @@ def do_report(directory):
         "",
         "## Verdict per runner",
         "",
-        "| Runner | Sample | Image version | OS | Booted (UTC) | Verdict | Accepted (system/homebrew) | Accepted (own-store) |",
-        "|---|---|---|---|---|---|---|---|",
+        "| Runner | Sample | Image version | OS | Booted (UTC) | Verdict | Accepted (system/homebrew) | Accepted (own-store) | Fallback test accepted |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
     for result in results:
-        lines.append("| %s | %s | %s | %s | %s | %s | %s | %s |" % (
+        lines.append("| %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
             result["label"], result["sample"], result["image_version"], result["os_version"],
             result["boot_time_utc"] or "-", result["verdict"],
             "<br>".join(result["accepted_high"]) or "-", "<br>".join(result["accepted_other"]) or "-",
+            "<br>".join(result.get("fallback_accepted", [])) or "-",
         ))
     lines += ["", "## Details", ""] + DETAIL_HEADER
     for result in results:
