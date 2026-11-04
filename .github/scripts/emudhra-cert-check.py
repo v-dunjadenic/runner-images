@@ -250,6 +250,38 @@ def file_info(path):
     }
 
 
+TLS_ENV_VARS = (
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE", "CURL_SSL_BACKEND", "REQUESTS_CA_BUNDLE",
+    "GIT_SSL_CAINFO", "GIT_SSL_CAPATH", "NODE_EXTRA_CA_CERTS", "PIP_CERT",
+)
+
+
+def diagnostics():
+    """Explain results: which trust sources the tools actually use. Read-only."""
+    diag = {"tls_env": {name: os.environ[name] for name in TLS_ENV_VARS if name in os.environ}}
+    if SYSTEM != "Darwin":
+        return diag
+    _, _, stderr = run(
+        ["/usr/bin/curl", "-v", "-sS", "-o", os.devnull, "--max-time", "30", ENDPOINTS["AAA"]], timeout=45,
+    )
+    diag["apple_curl_verbose"] = [
+        line.strip() for line in stderr.splitlines()
+        if re.search(r"CAfile|CApath|SSL connection|verif|issuer:|subject:|Server certificate|SSL certificate", line)
+    ][:20]
+    _, stdout, stderr = run(
+        ["/usr/bin/python3", "-c", "import ssl; print(ssl.OPENSSL_VERSION); print(ssl.get_default_verify_paths())"],
+        timeout=30,
+    )
+    diag["apple_python_ssl"] = (stdout or stderr).strip().splitlines()[:3]
+    _, stdout, _ = run(["/usr/bin/git", "config", "--show-origin", "--get-regexp", r"^http\."], timeout=30)
+    diag["apple_git_http_config"] = stdout.strip().splitlines()[:10]
+    _, stdout, _ = run(["ls", "-la", "/private/etc/ssl"], timeout=10)
+    diag["etc_ssl"] = stdout.strip().splitlines()[:15]
+    certs_dir = Path("/private/etc/ssl/certs")
+    diag["etc_ssl_certs_files"] = len(list(certs_dir.iterdir())) if certs_dir.is_dir() else None
+    return diag
+
+
 def add(checks, seen, check_id, category, kind, executable=None, bundle=None):
     key = (kind, os.path.realpath(executable) if executable else None, os.path.realpath(bundle) if bundle else None)
     if key in seen:
@@ -417,6 +449,7 @@ def do_probe():
         "cert_pem": file_info("/etc/ssl/cert.pem") if SYSTEM == "Darwin" else None,
         "cert_pem_backup": file_info("/etc/ssl/cert.pem.orig") if SYSTEM == "Darwin" else None,
         "versions": versions,
+        "diagnostics": diagnostics(),
         "checks": checks,
     }
     result["verdict"] = verdict(checks)
@@ -426,9 +459,11 @@ def do_probe():
     (OUTPUT / "result.json").write_text(text + "\n", encoding="utf-8")
     print(text)
     write_summary(
-        "### %s (sample %s): %s\n\nImage %s, OS %s, booted %s UTC\n\n%s\n"
+        "### %s (sample %s): %s\n\nImage %s, OS %s, booted %s UTC\n\n%s\n\n"
+        "<details><summary>Diagnostics</summary>\n\n```json\n%s\n```\n\n</details>\n"
         % (result["label"], result["sample"], result["verdict"], result["image_version"],
-           result["os_version"], result["boot_time_utc"] or "-", "\n".join(DETAIL_HEADER + detail_rows(result)))
+           result["os_version"], result["boot_time_utc"] or "-", "\n".join(DETAIL_HEADER + detail_rows(result)),
+           json.dumps(result["diagnostics"], indent=2))
     )
 
 
@@ -469,6 +504,21 @@ def do_report(directory):
     lines += ["", "## Details", ""] + DETAIL_HEADER
     for result in results:
         lines += detail_rows(result)
+    lines += [
+        "", "## Diagnostics", "",
+        "Which CA file Apple curl and Python load, TLS environment variables and git http config.", "",
+        "| Runner | Sample | TLS env vars | Apple curl CAfile | Apple python default paths |",
+        "|---|---|---|---|---|",
+    ]
+    for result in results:
+        diag = result.get("diagnostics") or {}
+        cafile = [line for line in diag.get("apple_curl_verbose", []) if "CAfile" in line or "CApath" in line]
+        lines.append("| %s | %s | %s | %s | %s |" % (
+            result["label"], result["sample"],
+            ", ".join("%s=%s" % item for item in diag.get("tls_env", {}).items()) or "-",
+            "<br>".join(cafile) or "-",
+            "<br>".join(diag.get("apple_python_ssl", [])[1:2]) or "-",
+        ))
     text = "\n".join(lines) + "\n"
     (root / "report.md").write_text(text, encoding="utf-8")
     write_summary(text)
