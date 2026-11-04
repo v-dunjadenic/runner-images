@@ -1,0 +1,82 @@
+name: eMudhra cert check
+
+# Read-only check of whether runner tools still trust the compromised eMudhra certificates.
+# Based on the 15018 workflow in v-sergei-pyshnoi/repro, extended with the checks from
+# actions/runner-images#15228 (Apple curl/git/python3, Homebrew curl/git and bundles, pip, Node.js).
+# Each runner label runs twice to sample more than one VM.
+
+on:
+  push:
+    branches:
+      - test-emudhra-cert-check
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: ${{ matrix.label }} / sample ${{ matrix.sample }}
+    runs-on: ${{ matrix.label }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        label:
+          - macos-14
+          - macos-15
+          - macos-15-intel
+          - macos-26
+          - macos-26-intel
+          - macos-latest
+          - xcode-27
+          # Baselines: Linux and Windows are expected to reject both chains
+          - ubuntu-24.04
+          - windows-2025
+        sample: [1, 2]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Probe certificate trust (read-only)
+        shell: bash
+        env:
+          RUNNER_LABEL: ${{ matrix.label }}
+          SAMPLE: ${{ matrix.sample }}
+        run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            python .github/scripts/emudhra-cert-check.py probe
+          else
+            python3 .github/scripts/emudhra-cert-check.py probe
+          fi
+
+      - name: Upload raw results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: emudhra-cert-check-${{ matrix.label }}-${{ matrix.sample }}
+          path: ${{ runner.temp }}/emudhra-cert-check
+          if-no-files-found: error
+
+  report:
+    name: Combined report
+    if: always()
+    needs: probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: emudhra-cert-check-*
+          path: results
+      - name: Build combined report
+        run: python3 .github/scripts/emudhra-cert-check.py report results
+      - uses: actions/upload-artifact@v4
+        with:
+          name: emudhra-cert-check-report
+          path: results/report.md
+          if-no-files-found: error
